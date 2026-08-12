@@ -66,7 +66,10 @@ build_macos_current() {
   cargo_sanitized build --release --locked
   run "$script_dir/package-macos.sh" "target/release/$bin_name" "$mac_app_path"
   zip_macos_app "$mac_app_path" "$mac_current_zip"
-  run "$script_dir/check-binary-paths.sh" "target/release/$bin_name" "$mac_app_path/Contents/MacOS/$bin_name"
+  run "$script_dir/check-binary-paths.sh" \
+    "target/release/$bin_name" \
+    "$mac_app_path/Contents/MacOS/$bin_name" \
+    "$mac_app_path/Contents/MacOS/age"
 
   echo
   echo "Built macOS app:"

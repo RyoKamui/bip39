@@ -70,10 +70,11 @@ Windows release builds use the Windows GUI subsystem, so double-clicking `bip39.
 ## Requirements
 
 - Rust stable.
-- The `age` command-line tool available on `PATH`.
-- Optional: set `BIP39_AGE_BINARY=/absolute/path/to/age` to force a specific trusted `age` binary.
+- The packaged macOS app includes a pinned, checksum-verified `age` executable and its BSD-3-Clause license.
+- Running from source, or running the standalone Linux or Windows binary, requires the `age` command-line tool on `PATH`.
+- Optional: set `BIP39_AGE_BINARY=/absolute/path/to/age` to override the bundled or PATH-resolved executable with a specific trusted `age` binary.
 
-Backups are encrypted by the installed `age` binary. The app accepts pasted public recipients directly, including `age1...`, `age1pq...` when supported by your installed `age` build, and supported SSH recipients. It also accepts a file containing public recipients, such as an age identity file with a `# public key:` comment.
+Backups are encrypted by the bundled or installed `age` binary. The app accepts pasted public recipients directly, including `age1...`, `age1pq...` when supported by the selected `age` build, and supported SSH recipients. It also accepts a file containing public recipients, such as an age identity file with a `# public key:` comment.
 
 To create a post-quantum hybrid recipient with an `age` build that supports it:
 
@@ -83,11 +84,11 @@ age-keygen -pq -o pq-key.txt
 
 ## Main Flows
 
-### New Seed
+### Create Backup
 
-- Generate a new 24-word BIP-39 mnemonic using OS randomness.
+- Generate a new 24-word BIP-39 mnemonic using OS randomness, or import an existing valid BIP-39 seed phrase.
 - Choose the BIP-39 language before generation.
-- Add an optional BIP-39 passphrase.
+- Enter an optional BIP-39 passphrase and choose whether to include it in the encrypted backup.
 - Save an age-encrypted backup by pasting a public recipient or selecting a recipient file.
 - Enable SSKR to save recovery shares instead of the raw seed phrase.
 - Choose SSKR group count, group threshold, shares per group, and required shares per group.
@@ -98,7 +99,8 @@ age-keygen -pq -o pq-key.txt
 - Paste a literal `AGE-SECRET-KEY-...` identity or select an identity file.
 - View the decrypted JSON in a structured, human-readable layout.
 - Sensitive fields are masked until explicitly revealed.
-- If a backup contains SSKR shares, use `Recover SSKR Seed` to load the recovered mnemonic into address derivation.
+- SSKR backups are recovered automatically after decryption; the reconstructed phrase appears in the summary when sensitive values are revealed.
+- Decrypted mnemonic and SSKR backups are loaded into address derivation automatically.
 
 ### Recover SSKR
 
@@ -139,4 +141,4 @@ New backups do not store derived BIP-39 seed bytes, root XPRV values, or derived
 - Private age identities can be pasted directly for decryption; public recipients are rejected in identity fields.
 - Sensitive GUI state can be cleared with `Clear Sensitive Data`.
 - In-memory sensitive strings and decrypted JSON are zeroized where the Rust types allow it, but a desktop GUI can still expose secrets to OS-level memory inspection, screenshots, clipboard history, accessibility tooling, and swap. Use this on a trusted machine.
-- Backup encryption strength and `age1pq...` support depend on the installed `age` binary. This app shells out to `age`; it does not implement AES-256-GCM or Argon2 itself.
+- Backup encryption strength and `age1pq...` support depend on the selected `age` binary. The macOS bundle ships the version documented by `scripts/fetch-age-macos.sh`; this app shells out to `age` and does not implement AES-256-GCM or Argon2 itself.

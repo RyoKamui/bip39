@@ -4,6 +4,7 @@
 )]
 
 use std::{
+    ffi::OsString,
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
@@ -119,6 +120,7 @@ struct BackupSummary {
     language: String,
     sskr_groups: usize,
     has_seed_phrase: bool,
+    recovered_from_sskr: bool,
 }
 
 impl BackupSummary {
@@ -136,6 +138,17 @@ impl BackupSummary {
             language,
             sskr_groups,
             has_seed_phrase: json_string_field(value, "seed_phrase").is_some(),
+            recovered_from_sskr: false,
+        }
+    }
+
+    fn seed_storage_label(&self) -> &'static str {
+        if self.has_seed_phrase {
+            "Seed storage: mnemonic"
+        } else if self.sskr_groups > 0 {
+            "Seed storage: SSKR shares"
+        } else {
+            "Seed storage: missing"
         }
     }
 }
@@ -192,6 +205,22 @@ enum Tab {
     Decrypt,
     Recover,
     Addresses,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SeedSource {
+    #[default]
+    Generate,
+    Import,
+}
+
+impl SeedSource {
+    fn phrase<'a>(self, generated: &'a str, imported: &'a str) -> &'a str {
+        match self {
+            Self::Generate => generated,
+            Self::Import => imported,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -321,9 +350,12 @@ struct AddressRow {
 struct Bip39Gui {
     tab: Tab,
     show_tips: bool,
+    seed_source: SeedSource,
     language: MnemonicLanguage,
     generated_phrase: Zeroizing<String>,
-    generated_passphrase: Zeroizing<String>,
+    imported_phrase: Zeroizing<String>,
+    backup_passphrase: Zeroizing<String>,
+    reveal_backup_passphrase: bool,
     store_passphrase: bool,
     reveal_generated: bool,
     sskr_enabled: bool,
@@ -367,7 +399,7 @@ impl Bip39Gui {
                 self.generate_status = "Generated a new 24-word seed.".to_string();
                 self.derive_language = self.language;
                 self.derive_phrase = self.generated_phrase.clone();
-                self.derive_passphrase = self.generated_passphrase.clone();
+                self.derive_passphrase = self.backup_passphrase.clone();
                 self.address_rows.clear();
                 self.derive_status = "Address inputs loaded from the new seed.".to_string();
             }
@@ -378,11 +410,27 @@ impl Bip39Gui {
         entropy.zeroize();
     }
 
-    fn save_generated_backup(&mut self) {
-        if self.generated_phrase.trim().is_empty() {
-            self.generate_status = "Generate a seed before saving.".to_string();
+    fn save_seed_backup(&mut self) {
+        let phrase = self.seed_source.phrase(
+            self.generated_phrase.as_str(),
+            self.imported_phrase.as_str(),
+        );
+        if phrase.trim().is_empty() {
+            self.generate_status = match self.seed_source {
+                SeedSource::Generate => "Generate a seed before saving.".to_string(),
+                SeedSource::Import => "Enter a seed phrase before saving.".to_string(),
+            };
             return;
         }
+
+        let mnemonic = match parse_backup_mnemonic(self.language, phrase) {
+            Ok(mnemonic) => mnemonic,
+            Err(err) => {
+                self.generate_status = err;
+                return;
+            }
+        };
+        let canonical_phrase = Zeroizing::new(mnemonic.to_string());
 
         let backup = GuiBackup {
             schema_version: BACKUP_SCHEMA_VERSION,
@@ -390,16 +438,16 @@ impl Bip39Gui {
             created_at_unix: current_unix_timestamp(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
             language: self.language.serialized_name().to_string(),
-            seed_phrase: Some(self.generated_phrase.to_string()),
+            seed_phrase: Some(canonical_phrase.to_string()),
             passphrase: self
                 .store_passphrase
-                .then(|| self.generated_passphrase.to_string())
+                .then(|| self.backup_passphrase.to_string())
                 .filter(|value| !value.is_empty()),
             sskr: GuiSskrBackup::default(),
             recovery_info: "Mnemonic seed phrase backup".to_string(),
         };
         let mut backup = if self.sskr_enabled {
-            match self.backup_with_sskr(backup) {
+            match self.backup_with_sskr(backup, &mnemonic) {
                 Ok(backup) => backup,
                 Err(err) => {
                     self.generate_status = err;
@@ -481,6 +529,7 @@ impl Bip39Gui {
         let language = MnemonicLanguage::from_backup_name(
             json_string_field(&backup_json, "language").unwrap_or("English"),
         );
+        let mut backup_summary = BackupSummary::from_json(&backup_json);
         self.derive_language = language;
         if let Some(seed_phrase) = json_string_field(&backup_json, "seed_phrase") {
             self.derive_phrase = Zeroizing::new(seed_phrase.to_string());
@@ -490,15 +539,41 @@ impl Bip39Gui {
                     .to_string(),
             );
             self.derive_status = "Address inputs loaded from the decrypted backup.".to_string();
+            self.decrypt_status =
+                "Backup decrypted and seed loaded into address derivation.".to_string();
+        } else if backup_summary.sskr_groups > 0 {
+            self.derive_passphrase = Zeroizing::new(
+                json_string_field(&backup_json, "passphrase")
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            match recover_mnemonic_from_backup_json(&backup_json, language) {
+                Ok(mnemonic_phrase) => {
+                    self.derive_phrase = mnemonic_phrase;
+                    self.derive_status = "Recovered SSKR seed loaded.".to_string();
+                    self.decrypt_status =
+                        "Backup decrypted, and the SSKR seed was recovered automatically."
+                            .to_string();
+                    backup_summary.recovered_from_sskr = true;
+                }
+                Err(err) => {
+                    self.derive_phrase.zeroize();
+                    self.derive_passphrase.zeroize();
+                    self.derive_status = format!("Automatic SSKR recovery failed: {err}");
+                    self.decrypt_status =
+                        format!("Backup decrypted, but automatic SSKR recovery failed: {err}");
+                }
+            }
         } else {
             self.derive_phrase.zeroize();
             self.derive_passphrase.zeroize();
             self.derive_status =
                 "Backup decrypted, but it does not contain a seed phrase.".to_string();
+            self.decrypt_status =
+                "Backup decrypted, but it does not contain seed material.".to_string();
         }
-        self.decrypted_backup = Some(BackupSummary::from_json(&backup_json));
+        self.decrypted_backup = Some(backup_summary);
         self.decrypted_backup_json = Some(SensitiveJson::new(backup_json));
-        self.decrypt_status = "Backup decrypted.".to_string();
         self.address_rows.clear();
     }
 
@@ -586,49 +661,10 @@ impl Bip39Gui {
         shares.zeroize();
     }
 
-    fn recover_from_decrypted_backup(&mut self) {
-        let Some(backup_json) = &self.decrypted_backup_json else {
-            self.decrypt_status = "Decrypt a backup before recovering SSKR shares.".to_string();
-            return;
-        };
-
-        let language = MnemonicLanguage::from_backup_name(
-            json_string_field(backup_json.as_value(), "language").unwrap_or("English"),
-        );
-        let passphrase = Zeroizing::new(
-            json_string_field(backup_json.as_value(), "passphrase")
-                .unwrap_or("")
-                .to_string(),
-        );
-        let mut shares = match shares_from_backup_json(backup_json.as_value(), language) {
-            Ok(shares) => shares,
-            Err(err) => {
-                self.decrypt_status = err;
-                return;
-            }
-        };
-
-        match recover_mnemonic_from_shares(shares.as_slice(), language) {
-            Ok(mnemonic_phrase) => {
-                self.derive_language = language;
-                self.derive_phrase = mnemonic_phrase;
-                self.derive_passphrase = passphrase;
-                self.address_rows.clear();
-                self.decrypt_status =
-                    "SSKR shares recovered and loaded into address derivation.".to_string();
-                self.derive_status = "Recovered SSKR seed loaded.".to_string();
-                self.tab = Tab::Addresses;
-            }
-            Err(err) => {
-                self.decrypt_status = err;
-            }
-        }
-        shares.zeroize();
-    }
-
     fn clear_sensitive_state(&mut self) {
         self.generated_phrase.zeroize();
-        self.generated_passphrase.zeroize();
+        self.imported_phrase.zeroize();
+        self.backup_passphrase.zeroize();
         self.identity_input.zeroize();
         self.decrypted_backup = None;
         self.decrypted_backup_json = None;
@@ -669,11 +705,12 @@ impl Bip39Gui {
         }
     }
 
-    fn backup_with_sskr(&mut self, mut backup: GuiBackup) -> Result<GuiBackup, String> {
+    fn backup_with_sskr(
+        &mut self,
+        mut backup: GuiBackup,
+        mnemonic: &Mnemonic,
+    ) -> Result<GuiBackup, String> {
         self.normalize_sskr_settings();
-        let mnemonic =
-            Mnemonic::parse_in_normalized(self.language.bip39(), self.generated_phrase.as_str())
-                .map_err(|err| format!("Generated seed phrase is invalid: {err}"))?;
         let mut entropy = mnemonic.to_entropy();
         let (sskr, recovery_info) =
             sskr_backup_from_entropy(&entropy, self.language, self.sskr_settings())?;
@@ -692,9 +729,12 @@ impl Default for Bip39Gui {
         Self {
             tab: Tab::Generate,
             show_tips: true,
+            seed_source: SeedSource::Generate,
             language: MnemonicLanguage::English,
             generated_phrase: Zeroizing::new(String::new()),
-            generated_passphrase: Zeroizing::new(String::new()),
+            imported_phrase: Zeroizing::new(String::new()),
+            backup_passphrase: Zeroizing::new(String::new()),
+            reveal_backup_passphrase: false,
             store_passphrase: false,
             reveal_generated: false,
             sskr_enabled: false,
@@ -735,7 +775,7 @@ impl eframe::App for Bip39Gui {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("BIP39 Tool");
                 ui.separator();
-                self.tab_button(ui, Tab::Generate, "New Seed");
+                self.tab_button(ui, Tab::Generate, "Create Backup");
                 self.tab_button(ui, Tab::Decrypt, "Open Backup");
                 self.tab_button(ui, Tab::Recover, "Recover SSKR");
                 self.tab_button(ui, Tab::Addresses, "Address Derivation");
@@ -770,36 +810,48 @@ impl Bip39Gui {
         self.normalize_sskr_settings();
         ui.add_space(8.0);
         ui.horizontal(|ui| {
+            form_label(ui, "Seed source");
+            ui.selectable_value(&mut self.seed_source, SeedSource::Generate, "Generate new");
+            ui.selectable_value(&mut self.seed_source, SeedSource::Import, "Import existing");
+        });
+        ui.horizontal(|ui| {
             form_label(ui, "Seed language");
             language_combo(ui, "generate_language", &mut self.language);
-            if ui.button("Generate Seed").clicked() {
+            if self.seed_source == SeedSource::Generate && ui.button("Generate Seed").clicked() {
                 self.new_seed();
             }
         });
 
         ui.separator();
+        if self.seed_source == SeedSource::Import {
+            multiline_text_row(ui, "Seed phrase", &mut self.imported_phrase, 4);
+        }
         ui.horizontal(|ui| {
             form_label(ui, "Passphrase");
             let response = ui.add_sized(
                 [320.0, 24.0],
-                egui::TextEdit::singleline(&mut *self.generated_passphrase)
-                    .password(true)
+                egui::TextEdit::singleline(&mut *self.backup_passphrase)
+                    .password(!self.reveal_backup_passphrase)
                     .desired_width(320.0),
             );
-            if response.changed()
+            if self.seed_source == SeedSource::Generate
+                && response.changed()
                 && !self.generated_phrase.is_empty()
                 && self.derive_phrase.as_str() == self.generated_phrase.as_str()
             {
-                self.derive_passphrase = self.generated_passphrase.clone();
+                self.derive_passphrase = self.backup_passphrase.clone();
             }
+            ui.checkbox(&mut self.reveal_backup_passphrase, "Reveal passphrase");
             ui.checkbox(&mut self.store_passphrase, "Include in encrypted backup");
         });
 
-        ui.horizontal(|ui| {
-            form_label(ui, "");
-            ui.checkbox(&mut self.reveal_generated, "Reveal seed phrase");
-        });
-        seed_phrase_box(ui, self.generated_phrase.as_str(), self.reveal_generated);
+        if self.seed_source == SeedSource::Generate {
+            ui.horizontal(|ui| {
+                form_label(ui, "");
+                ui.checkbox(&mut self.reveal_generated, "Reveal seed phrase");
+            });
+            seed_phrase_box(ui, self.generated_phrase.as_str(), self.reveal_generated);
+        }
 
         ui.separator();
         ui.horizontal(|ui| {
@@ -867,7 +919,7 @@ impl Bip39Gui {
         ui.horizontal(|ui| {
             form_label(ui, "");
             if ui.button("Encrypt and Save").clicked() {
-                self.save_generated_backup();
+                self.save_seed_backup();
             }
             status_label(ui, &self.generate_status);
         });
@@ -910,10 +962,14 @@ impl Bip39Gui {
         });
 
         ui.separator();
-        let can_recover_sskr = self
-            .decrypted_backup_json
+        let recovered_from_sskr = self
+            .decrypted_backup
             .as_ref()
-            .is_some_and(|backup_json| decrypted_json_has_sskr(backup_json.as_value()));
+            .is_some_and(|backup| backup.recovered_from_sskr);
+        let seed_loaded = self
+            .decrypted_backup
+            .as_ref()
+            .is_some_and(|backup| backup.has_seed_phrase || backup.recovered_from_sskr);
         if self.decrypted_backup_json.is_some() {
             ui.horizontal(|ui| {
                 if let Some(backup) = &self.decrypted_backup {
@@ -921,26 +977,32 @@ impl Bip39Gui {
                     ui.separator();
                     ui.label(format!("SSKR groups: {}", backup.sskr_groups));
                     ui.separator();
-                    if backup.has_seed_phrase {
-                        ui.label("Mnemonic: present");
-                    } else {
-                        ui.label("Mnemonic: not present");
+                    ui.label(backup.seed_storage_label());
+                    if backup.recovered_from_sskr {
+                        ui.separator();
+                        ui.label("Recovery: complete");
                     }
                     ui.separator();
                 }
                 ui.checkbox(&mut self.reveal_decrypted, "Reveal sensitive values");
             });
-            if can_recover_sskr {
+            if seed_loaded {
                 ui.horizontal(|ui| {
                     form_label(ui, "");
-                    if ui.button("Recover SSKR Seed").clicked() {
-                        self.recover_from_decrypted_backup();
+                    if ui.button("Open Address Derivation").clicked() {
+                        self.tab = Tab::Addresses;
                     }
                 });
             }
 
             if let Some(backup_json) = &self.decrypted_backup_json {
-                render_backup_view(ui, backup_json.as_value(), self.reveal_decrypted);
+                let recovered_phrase = recovered_from_sskr.then_some(self.derive_phrase.as_str());
+                render_backup_view(
+                    ui,
+                    backup_json.as_value(),
+                    recovered_phrase,
+                    self.reveal_decrypted,
+                );
             }
         }
     }
@@ -1060,6 +1122,7 @@ fn tips_panel(ui: &mut egui::Ui, tab: Tab) {
         ui.heading("Tips");
         match tab {
             Tab::Generate => {
+                tip_line(ui, "Generate a new seed or import an existing BIP-39 seed phrase to encrypt and save.");
                 tip_line(ui, "Seed language selects the BIP-39 wordlist; it does not translate an existing phrase.");
                 tip_line(ui, "Enable SSKR backup to split mnemonic entropy into recovery shares instead of saving the raw seed phrase.");
                 tip_line(ui, "The passphrase is not stored unless Include in encrypted backup is checked.");
@@ -1069,7 +1132,7 @@ fn tips_panel(ui: &mut egui::Ui, tab: Tab) {
                 tip_line(ui, "Use an encrypted .age backup file and a private AGE-SECRET-KEY identity or identity file.");
                 tip_line(ui, "A public age1 or age1pq recipient cannot decrypt; it is only used when saving.");
                 tip_line(ui, "The JSON viewer shows every decrypted backup field, with sensitive values masked until revealed.");
-                tip_line(ui, "If the backup contains a seed phrase, address derivation is loaded automatically.");
+                tip_line(ui, "Mnemonic and SSKR backups are loaded into address derivation automatically.");
             }
             Tab::Recover => {
                 tip_line(ui, "Paste one SSKR share per line, in hex or mnemonic form.");
@@ -1185,11 +1248,19 @@ fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a 
     value.get(key).and_then(serde_json::Value::as_str)
 }
 
-fn render_backup_view(ui: &mut egui::Ui, value: &serde_json::Value, reveal_sensitive: bool) {
+fn render_backup_view(
+    ui: &mut egui::Ui,
+    value: &serde_json::Value,
+    recovered_seed_phrase: Option<&str>,
+    reveal_sensitive: bool,
+) {
     ui.add_space(8.0);
     match value {
         serde_json::Value::Object(map) => {
-            render_backup_summary(ui, map);
+            render_backup_summary(ui, map, recovered_seed_phrase.is_some());
+            if let Some(seed_phrase) = recovered_seed_phrase {
+                render_recovered_seed_material(ui, seed_phrase, reveal_sensitive);
+            }
             render_seed_material(ui, map, reveal_sensitive);
             render_sskr_material(ui, map, reveal_sensitive);
             render_additional_fields(ui, map, reveal_sensitive);
@@ -1201,7 +1272,11 @@ fn render_backup_view(ui: &mut egui::Ui, value: &serde_json::Value, reveal_sensi
     }
 }
 
-fn render_backup_summary(ui: &mut egui::Ui, map: &serde_json::Map<String, serde_json::Value>) {
+fn render_backup_summary(
+    ui: &mut egui::Ui,
+    map: &serde_json::Map<String, serde_json::Value>,
+    recovered_from_sskr: bool,
+) {
     section_header(ui, "Backup Summary");
     field_grid(ui, "backup_summary_grid", |ui| {
         render_field_row(
@@ -1251,6 +1326,33 @@ fn render_backup_summary(ui: &mut egui::Ui, map: &serde_json::Map<String, serde_
             map.len().to_string(),
             false,
             egui::Color32::DARK_GRAY,
+        );
+        if recovered_from_sskr {
+            render_field_row(
+                ui,
+                "SSKR Recovery",
+                "Recovered automatically".to_string(),
+                false,
+                egui::Color32::DARK_GRAY,
+            );
+        }
+    });
+}
+
+fn render_recovered_seed_material(ui: &mut egui::Ui, seed_phrase: &str, reveal_sensitive: bool) {
+    section_header(ui, "Recovered Seed Material");
+    field_grid(ui, "recovered_seed_material_grid", |ui| {
+        let display = if reveal_sensitive {
+            seed_phrase.to_string()
+        } else {
+            mask_secret_text(seed_phrase)
+        };
+        render_field_row(
+            ui,
+            "Seed Phrase",
+            display,
+            true,
+            sensitive_color("seed_phrase", reveal_sensitive),
         );
     });
 }
@@ -1757,12 +1859,14 @@ fn recover_mnemonic_from_shares(
     Ok(Zeroizing::new(mnemonic.to_string()))
 }
 
-fn decrypted_json_has_sskr(value: &serde_json::Value) -> bool {
-    value
-        .get("sskr")
-        .and_then(|sskr| sskr.get("groups"))
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|groups| !groups.is_empty())
+fn recover_mnemonic_from_backup_json(
+    value: &serde_json::Value,
+    language: MnemonicLanguage,
+) -> Result<Zeroizing<String>, String> {
+    let mut shares = shares_from_backup_json(value, language)?;
+    let result = recover_mnemonic_from_shares(shares.as_slice(), language);
+    shares.zeroize();
+    result
 }
 
 fn validate_sskr_settings(settings: SskrSettings) -> Result<(), String> {
@@ -1932,6 +2036,11 @@ fn status_label(ui: &mut egui::Ui, status: &str) {
         egui::Color32::from_rgb(22, 108, 56)
     };
     ui.colored_label(color, status);
+}
+
+fn parse_backup_mnemonic(language: MnemonicLanguage, phrase: &str) -> Result<Mnemonic, String> {
+    Mnemonic::parse_in_normalized(language.bip39(), phrase.trim())
+        .map_err(|err| format!("Seed phrase is invalid for {}: {err}", language.label()))
 }
 
 fn seed_phrase_box(ui: &mut egui::Ui, phrase: &str, reveal: bool) {
@@ -2161,8 +2270,31 @@ fn age_identity_from_input(input: &str) -> Result<AgeIdentityInput, String> {
     )
 }
 
+fn resolve_age_binary(
+    override_binary: Option<OsString>,
+    current_executable: Option<&Path>,
+) -> OsString {
+    if let Some(binary) = override_binary {
+        return binary;
+    }
+
+    if let Some(bundled_binary) = current_executable
+        .and_then(Path::parent)
+        .map(|directory| directory.join("age"))
+        .filter(|path| path.is_file())
+    {
+        return bundled_binary.into_os_string();
+    }
+
+    "age".into()
+}
+
 fn age_command() -> Command {
-    let binary = std::env::var_os("BIP39_AGE_BINARY").unwrap_or_else(|| "age".into());
+    let current_executable = std::env::current_exe().ok();
+    let binary = resolve_age_binary(
+        std::env::var_os("BIP39_AGE_BINARY"),
+        current_executable.as_deref(),
+    );
     Command::new(binary)
 }
 
@@ -2515,6 +2647,37 @@ mod tests {
     }
 
     #[test]
+    fn bundled_age_next_to_application_binary_is_preferred_over_path() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let executable = tempdir.path().join("bip39");
+        let bundled_age = tempdir.path().join("age");
+        std::fs::write(&bundled_age, b"bundled age").unwrap();
+
+        assert_eq!(
+            resolve_age_binary(None, Some(&executable)),
+            bundled_age.into_os_string()
+        );
+    }
+
+    #[test]
+    fn configured_age_binary_overrides_bundled_binary() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let executable = tempdir.path().join("bip39");
+        std::fs::write(tempdir.path().join("age"), b"bundled age").unwrap();
+        let configured = OsString::from("/custom/age");
+
+        assert_eq!(
+            resolve_age_binary(Some(configured.clone()), Some(&executable)),
+            configured
+        );
+    }
+
+    #[test]
+    fn age_binary_falls_back_to_path_lookup() {
+        assert_eq!(resolve_age_binary(None, None), OsString::from("age"));
+    }
+
+    #[test]
     fn recipient_file_extracts_embedded_age_recipient() {
         let tempdir = tempfile::tempdir().unwrap();
         let recipient_file = tempdir.path().join("config.toml.tmpl");
@@ -2558,6 +2721,28 @@ AGE-SECRET-KEY-should-be-ignored
     }
 
     #[test]
+    fn imported_seed_phrase_is_validated_and_canonicalized() {
+        let phrase = "  abandon  abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about  ";
+        let mnemonic = parse_backup_mnemonic(MnemonicLanguage::English, phrase).unwrap();
+
+        assert_eq!(
+            mnemonic.to_string(),
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        );
+    }
+
+    #[test]
+    fn imported_seed_phrase_must_match_selected_language_and_checksum() {
+        let err = parse_backup_mnemonic(
+            MnemonicLanguage::English,
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("Seed phrase is invalid for English"));
+    }
+
+    #[test]
     fn bare_filename_parent_is_current_directory() {
         assert_eq!(save_parent_dir(Path::new("backup.age")), Path::new("."));
     }
@@ -2598,6 +2783,10 @@ AGE-SECRET-KEY-should-be-ignored
             display_json_value("share_hex", &share["share_hex"], true),
             "0123456789abcdef"
         );
+
+        let summary = BackupSummary::from_json(&backup_json);
+        assert_eq!(summary.seed_storage_label(), "Seed storage: mnemonic");
+        assert!(!summary.recovered_from_sskr);
     }
 
     #[test]
@@ -2656,6 +2845,12 @@ AGE-SECRET-KEY-should-be-ignored
             "language": "English",
             "sskr": sskr,
         });
+        let summary = BackupSummary::from_json(&backup_json);
+        assert_eq!(summary.seed_storage_label(), "Seed storage: SSKR shares");
+        let automatically_recovered =
+            recover_mnemonic_from_backup_json(&backup_json, MnemonicLanguage::English).unwrap();
+        assert_eq!(automatically_recovered.as_str(), expected_mnemonic);
+
         let mut shares = shares_from_backup_json(&backup_json, MnemonicLanguage::English).unwrap();
         shares.truncate(2);
 
