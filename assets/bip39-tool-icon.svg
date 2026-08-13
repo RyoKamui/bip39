@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="background" x1="110" y1="82" x2="906" y2="942" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#203B4B"/>
+      <stop offset="1" stop-color="#091722"/>
+    </linearGradient>
+    <linearGradient id="fortress" x1="186" y1="278" x2="842" y2="828" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#52D8C8"/>
+      <stop offset="1" stop-color="#168F89"/>
+    </linearGradient>
+    <linearGradient id="seed" x1="470" y1="550" x2="554" y2="718" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F4FFFC"/>
+      <stop offset="1" stop-color="#8CEBDD"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+
+  <rect x="44" y="44" width="936" height="936" rx="220" fill="url(#background)"/>
+
+  <path d="M512 246 835 358v211c0 141-93 254-323 328-230-74-323-187-323-328V358l323-112Z" fill="#38C7B8" opacity=".16" filter="url(#glow)"/>
+
+  <!-- A fortress built from mnemonic words, protecting the deterministic seed. -->
+  <path d="M156 286h92v78h62v-78h92v142h220V286h92v78h62v-78h92v544H156V286Z" fill="url(#fortress)" stroke="#B8FFF4" stroke-width="26" stroke-linejoin="round"/>
+  <path d="M182 456h216M626 456h216" fill="none" stroke="#7CE7DA" stroke-width="18" stroke-linecap="round" opacity=".75"/>
+
+  <!-- Twenty-four illuminated blocks: the app's default 24-word BIP-39 mnemonic. -->
+  <g fill="#E8FFFA">
+    <rect x="194" y="494" width="49" height="23" rx="11.5"/>
+    <rect x="261" y="494" width="39" height="23" rx="11.5"/>
+    <rect x="318" y="494" width="54" height="23" rx="11.5"/>
+    <rect x="194" y="552" width="38" height="23" rx="11.5"/>
+    <rect x="250" y="552" width="52" height="23" rx="11.5"/>
+    <rect x="320" y="552" width="52" height="23" rx="11.5"/>
+    <rect x="194" y="610" width="53" height="23" rx="11.5"/>
+    <rect x="265" y="610" width="38" height="23" rx="11.5"/>
+    <rect x="321" y="610" width="51" height="23" rx="11.5"/>
+    <rect x="194" y="668" width="41" height="23" rx="11.5"/>
+    <rect x="253" y="668" width="50" height="23" rx="11.5"/>
+    <rect x="321" y="668" width="51" height="23" rx="11.5"/>
+
+    <rect x="652" y="494" width="49" height="23" rx="11.5"/>
+    <rect x="719" y="494" width="39" height="23" rx="11.5"/>
+    <rect x="776" y="494" width="54" height="23" rx="11.5"/>
+    <rect x="652" y="552" width="38" height="23" rx="11.5"/>
+    <rect x="708" y="552" width="52" height="23" rx="11.5"/>
+    <rect x="778" y="552" width="52" height="23" rx="11.5"/>
+    <rect x="652" y="610" width="53" height="23" rx="11.5"/>
+    <rect x="723" y="610" width="38" height="23" rx="11.5"/>
+    <rect x="779" y="610" width="51" height="23" rx="11.5"/>
+    <rect x="652" y="668" width="41" height="23" rx="11.5"/>
+    <rect x="711" y="668" width="50" height="23" rx="11.5"/>
+    <rect x="779" y="668" width="51" height="23" rx="11.5"/>
+  </g>
+
+  <!-- The arched vault contains the protected seed, not a generic keyhole. -->
+  <path d="M414 830V632c0-130 196-130 196 0v198H414Z" fill="#0C2532" stroke="#D9FFF8" stroke-width="24" stroke-linejoin="round"/>
+  <path d="M512 544C586 592 589 655 512 750C435 655 438 592 512 544Z" fill="url(#seed)" stroke="#F8FFFD" stroke-width="15" stroke-linejoin="round"/>
+  <g fill="none" stroke="#167873" stroke-width="18" stroke-linecap="round">
+    <path d="M483 620h58"/>
+    <path d="M478 666h68"/>
+  </g>
+
+  <path d="M136 830h752" fill="none" stroke="#D9FFF8" stroke-width="28" stroke-linecap="round"/>
+</svg>

@@ -1,6 +1,15 @@
 use std::env;
 
 fn main() {
+    #[cfg(windows)]
+    {
+        println!("cargo:rerun-if-changed=assets/BIP39Tool.ico");
+        winresource::WindowsResource::new()
+            .set_icon("assets/BIP39Tool.ico")
+            .compile()
+            .expect("failed to embed the Windows application icon");
+    }
+
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=BIP39_ALLOW_UNSANITIZED_RELEASE");
 

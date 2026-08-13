@@ -6,9 +6,36 @@ app_dir="${2:-target/release/BIP39 Tool.AppDir}"
 app_name="${BIP39_APP_NAME:-BIP39 Tool}"
 desktop_id="${BIP39_DESKTOP_ID:-dev.local.bip39-tool}"
 executable_name="${BIP39_EXECUTABLE_NAME:-bip39}"
+age_bundle_dir="${3:-}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+icon_svg="$repo_root/assets/bip39-tool-icon.svg"
+icon_png="$repo_root/assets/bip39-tool-icon-256.png"
 
 if [[ ! -f "$binary_path" ]]; then
   echo "Binary not found: $binary_path" >&2
+  exit 1
+fi
+if [[ ! -f "$icon_svg" || ! -f "$icon_png" ]]; then
+  echo "Linux application icons are missing from assets/." >&2
+  exit 1
+fi
+
+if [[ -z "$age_bundle_dir" ]]; then
+  binary_description="$(file -b "$binary_path")"
+  case "$binary_description" in
+    *aarch64* | *ARM\ aarch64*) age_arch="aarch64" ;;
+    *x86-64* | *x86_64*) age_arch="x86_64" ;;
+    *)
+      echo "Cannot determine Linux binary architecture: $binary_description" >&2
+      exit 1
+      ;;
+  esac
+  age_bundle_dir="$("$script_dir/fetch-age.sh" linux "$age_arch")"
+fi
+
+if [[ ! -x "$age_bundle_dir/age" || ! -f "$age_bundle_dir/LICENSE" ]]; then
+  echo "Complete bundled age files not found: $age_bundle_dir" >&2
   exit 1
 fi
 
@@ -18,10 +45,22 @@ if [[ -z "$app_dir" || "$app_dir" == "/" || "$app_dir" == "." || "$app_dir" == "
 fi
 
 rm -rf "$app_dir"
-mkdir -p "$app_dir/usr/bin" "$app_dir/usr/share/applications"
+mkdir -p \
+  "$app_dir/usr/bin" \
+  "$app_dir/usr/share/applications" \
+  "$app_dir/usr/share/icons/hicolor/scalable/apps" \
+  "$app_dir/usr/share/icons/hicolor/256x256/apps" \
+  "$app_dir/usr/share/licenses/bip39-tool"
 
 cp "$binary_path" "$app_dir/usr/bin/$executable_name"
 chmod 755 "$app_dir/usr/bin/$executable_name"
+cp "$age_bundle_dir/age" "$app_dir/usr/bin/age"
+chmod 755 "$app_dir/usr/bin/age"
+cp "$age_bundle_dir/LICENSE" "$app_dir/usr/share/licenses/bip39-tool/age-LICENSE.txt"
+cp "$repo_root/assets/Noto-CJK-LICENSE.txt" "$app_dir/usr/share/licenses/bip39-tool/Noto-CJK-LICENSE.txt"
+cp "$icon_svg" "$app_dir/usr/share/icons/hicolor/scalable/apps/$desktop_id.svg"
+cp "$icon_png" "$app_dir/usr/share/icons/hicolor/256x256/apps/$desktop_id.png"
+cp "$icon_png" "$app_dir/.DirIcon"
 
 cat > "$app_dir/AppRun" <<APPRUN
 #!/usr/bin/env bash
@@ -41,6 +80,7 @@ Exec=AppRun
 Terminal=false
 Categories=Utility;Finance;
 StartupNotify=true
+Icon=$desktop_id
 DESKTOP
 
 cp "$app_dir/$desktop_id.desktop" "$app_dir/usr/share/applications/$desktop_id.desktop"
@@ -63,6 +103,7 @@ Exec="\$APPDIR/AppRun"
 Terminal=false
 Categories=Utility;Finance;
 StartupNotify=true
+Icon=$APPDIR/usr/share/icons/hicolor/256x256/apps/$desktop_id.png
 DESKTOP
 
 chmod 644 "\$desktop_file"

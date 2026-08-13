@@ -8,9 +8,16 @@ bundle_name="${BIP39_BUNDLE_NAME:-BIP39 Tool}"
 bundle_id="${BIP39_BUNDLE_ID:-dev.local.bip39-tool}"
 version="${BIP39_BUNDLE_VERSION:-0.1.0}"
 executable_name="bip39"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+icon_path="$repo_root/assets/BIP39Tool.icns"
 
 if [[ ! -f "$binary_path" ]]; then
   echo "Binary not found: $binary_path" >&2
+  exit 1
+fi
+if [[ ! -f "$icon_path" ]]; then
+  echo "Application icon not found: $icon_path" >&2
   exit 1
 fi
 
@@ -24,8 +31,7 @@ if [[ -z "$age_bundle_dir" ]]; then
       exit 1
       ;;
   esac
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  age_bundle_dir="$("$script_dir/fetch-age-macos.sh" "$age_arch")"
+  age_bundle_dir="$("$script_dir/fetch-age.sh" darwin "$age_arch")"
 fi
 
 if [[ ! -x "$age_bundle_dir/age" ]]; then
@@ -45,6 +51,8 @@ chmod 755 "$app_path/Contents/MacOS/$executable_name"
 cp "$age_bundle_dir/age" "$app_path/Contents/MacOS/age"
 chmod 755 "$app_path/Contents/MacOS/age"
 cp "$age_bundle_dir/LICENSE" "$app_path/Contents/Resources/age-LICENSE.txt"
+cp "$icon_path" "$app_path/Contents/Resources/BIP39Tool.icns"
+cp "$repo_root/assets/Noto-CJK-LICENSE.txt" "$app_path/Contents/Resources/Noto-CJK-LICENSE.txt"
 
 cat > "$app_path/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -65,6 +73,8 @@ cat > "$app_path/Contents/Info.plist" <<PLIST
   <string>${bundle_name}</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>BIP39Tool</string>
   <key>CFBundleShortVersionString</key>
   <string>${version}</string>
   <key>CFBundleVersion</key>

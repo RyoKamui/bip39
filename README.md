@@ -33,7 +33,7 @@ Platform outputs:
 
 - macOS: `target/release/BIP39 Tool.app` and `target/release/bip39-tool-macos.zip`
 - Linux: `target/release/BIP39 Tool.AppDir` and `target/release/bip39-tool-linux.tar.gz`
-- Windows: `target\release\bip39.exe`
+- Windows: `target\release\BIP39 Tool Windows` and `target\release\bip39-tool-windows.zip`
 
 The macOS zip is only for release/upload/sharing. For local use, open the app bundle directly:
 
@@ -62,16 +62,17 @@ GitHub Actions builds native artifacts on each OS:
 
 - `bip39-tool-macos`: Apple Silicon macOS app bundle zip
 - `bip39-tool-linux`: Linux AppDir tarball
-- `bip39-tool-windows`: Windows GUI executable
-- raw binary artifacts for macOS and Linux are also uploaded for debugging
+- `bip39-tool-windows`: Windows GUI package zip
+- raw binary artifacts for macOS, Linux, and Windows are also uploaded for debugging
 
 Windows release builds use the Windows GUI subsystem, so double-clicking `bip39.exe` should open the GUI without a console window.
 
 ## Requirements
 
 - Rust stable.
-- The packaged macOS app includes a pinned, checksum-verified `age` executable and its BSD-3-Clause license.
-- Running from source, or running the standalone Linux or Windows binary, requires the `age` command-line tool on `PATH`.
+- Every packaged macOS, Linux, and Windows app includes a pinned, checksum-verified `age` executable and its BSD-3-Clause license.
+- On startup, the app checks the official age GitHub release at most once per day. A newer platform build is downloaded into the per-user data directory, checked against the release asset's SHA-256 digest, launch-tested, and then preferred over the bundled offline fallback. The signed app package itself is not modified.
+- Running a raw standalone binary still falls back to an `age` command on `PATH` if neither an updated nor adjacent bundled executable exists.
 - Optional: set `BIP39_AGE_BINARY=/absolute/path/to/age` to override the bundled or PATH-resolved executable with a specific trusted `age` binary.
 
 Backups are encrypted by the bundled or installed `age` binary. The app accepts pasted public recipients directly, including `age1...`, `age1pq...` when supported by the selected `age` build, and supported SSH recipients. It also accepts a file containing public recipients, such as an age identity file with a `# public key:` comment.
@@ -83,6 +84,8 @@ age-keygen -pq -o pq-key.txt
 ```
 
 ## Main Flows
+
+The app opens at 1240 × 860 pixels and remains usable down to 960 × 680. Create Backup and Recover SSKR switch between two-column and stacked layouts based on available width. A bottom fade and localized “More below” indicator makes any remaining scrollable content explicit. Guidance tips are available in English, Simplified Chinese, Japanese, and Korean.
 
 ### Create Backup
 
@@ -141,4 +144,4 @@ New backups do not store derived BIP-39 seed bytes, root XPRV values, or derived
 - Private age identities can be pasted directly for decryption; public recipients are rejected in identity fields.
 - Sensitive GUI state can be cleared with `Clear Sensitive Data`.
 - In-memory sensitive strings and decrypted JSON are zeroized where the Rust types allow it, but a desktop GUI can still expose secrets to OS-level memory inspection, screenshots, clipboard history, accessibility tooling, and swap. Use this on a trusted machine.
-- Backup encryption strength and `age1pq...` support depend on the selected `age` binary. The macOS bundle ships the version documented by `scripts/fetch-age-macos.sh`; this app shells out to `age` and does not implement AES-256-GCM or Argon2 itself.
+- Backup encryption strength and `age1pq...` support depend on the selected `age` binary. All platform packages ship the version documented by `scripts/fetch-age.sh`; this app shells out to `age` and does not implement AES-256-GCM or Argon2 itself.

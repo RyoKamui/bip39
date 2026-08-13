@@ -16,7 +16,7 @@ jobs:
           - os: windows-2025
             target: x86_64-pc-windows-msvc
             artifact_path: target/x86_64-pc-windows-msvc/release/bip39.exe
-            artifact_name: bip39-tool-windows
+            artifact_name: bip39-tool-windows-bin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_path: target/x86_64-unknown-linux-gnu/release/bip39
@@ -86,6 +86,16 @@ jobs:
           bash scripts/package-macos.sh "${{ matrix.artifact_path }}" "BIP39 Tool.app"
           ditto -c -k --sequesterRsrc --keepParent "BIP39 Tool.app" bip39-tool-macos.zip
 
+      - name: Package Windows App
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/package-windows.sh "${{ matrix.artifact_path }}" "BIP39 Tool Windows"
+
+      - name: Archive Windows App
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -LiteralPath 'BIP39 Tool Windows' -DestinationPath bip39-tool-windows.zip -Force
+
       - name: Check Binary Path Leaks
         if: runner.os != 'Windows'
         run: |
@@ -116,6 +126,16 @@ jobs:
         with:
           name: bip39-tool-macos
           path: bip39-tool-macos.zip
+          if-no-files-found: error
+          compression-level: 6
+          overwrite: true
+
+      - name: Upload Windows App Artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bip39-tool-windows
+          path: bip39-tool-windows.zip
           if-no-files-found: error
           compression-level: 6
           overwrite: true

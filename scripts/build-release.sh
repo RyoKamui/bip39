@@ -11,6 +11,8 @@ mac_app_path="target/release/$app_name.app"
 mac_current_zip="target/release/bip39-tool-macos.zip"
 linux_appdir_path="target/release/$app_name.AppDir"
 linux_appdir_tarball="target/release/bip39-tool-linux.tar.gz"
+windows_package_path="target/release/$app_name Windows"
+windows_package_zip="target/release/bip39-tool-windows.zip"
 
 host_os() {
   case "$(uname -s)" in
@@ -90,7 +92,10 @@ build_linux_appdir() {
   run "$script_dir/package-linux.sh" "target/release/$bin_name" "$linux_appdir_path"
   rm -f "$linux_appdir_tarball"
   run tar -C target/release -czf "$linux_appdir_tarball" "$app_name.AppDir"
-  run "$script_dir/check-binary-paths.sh" "target/release/$bin_name" "$linux_appdir_path/usr/bin/$bin_name"
+  run "$script_dir/check-binary-paths.sh" \
+    "target/release/$bin_name" \
+    "$linux_appdir_path/usr/bin/$bin_name" \
+    "$linux_appdir_path/usr/bin/age"
 
   echo
   echo "Built Linux AppDir:"
@@ -98,26 +103,35 @@ build_linux_appdir() {
   echo "  $linux_appdir_tarball"
 }
 
-build_windows_exe() {
+build_windows_package() {
   if [[ "$(host_os)" != "windows" ]]; then
     echo "Windows GUI executables should be built on Windows. Use GitHub Actions or run this script from Git Bash/MSYS on Windows." >&2
     exit 1
   fi
 
   require_command cargo
+  require_command powershell.exe
   cargo_sanitized build --release --locked
-  run "$script_dir/check-binary-paths.sh" "target/release/$bin_name.exe"
+  run "$script_dir/package-windows.sh" "target/release/$bin_name.exe" "$windows_package_path"
+  rm -f "$windows_package_zip"
+  run powershell.exe -NoProfile -Command \
+    "Compress-Archive -LiteralPath '$windows_package_path' -DestinationPath '$windows_package_zip' -Force"
+  run "$script_dir/check-binary-paths.sh" \
+    "target/release/$bin_name.exe" \
+    "$windows_package_path/$app_name.exe" \
+    "$windows_package_path/age.exe"
 
   echo
-  echo "Built Windows GUI executable:"
-  echo "  target/release/$bin_name.exe"
+  echo "Built Windows package:"
+  echo "  $windows_package_path"
+  echo "  $windows_package_zip"
 }
 
 build_current_platform() {
   case "$(host_os)" in
     macos) build_macos_current ;;
     linux) build_linux_appdir ;;
-    windows) build_windows_exe ;;
+    windows) build_windows_package ;;
     *)
       echo "Unsupported OS: $(uname -s)" >&2
       exit 1
@@ -140,7 +154,7 @@ Commands:
   current  Build and package for this machine's OS.
   macos    Build a macOS .app and zip. Must be run on macOS.
   linux    Build a Linux AppDir and tarball. Must be run on Linux.
-  windows  Build a Windows GUI .exe. Must be run on Windows.
+  windows  Build a Windows GUI package and zip. Must be run on Windows.
   check    Run fmt, clippy, and tests.
   help     Show this help.
 
@@ -155,7 +169,7 @@ prompt_command() {
   case "$(host_os)" in
     macos) echo "  1) macOS app" >&2 ;;
     linux) echo "  1) Linux AppDir" >&2 ;;
-    windows) echo "  1) Windows GUI exe" >&2 ;;
+    windows) echo "  1) Windows GUI package" >&2 ;;
     *) echo "  1) Current OS app/package" >&2 ;;
   esac
   echo "  2) Checks" >&2
@@ -187,7 +201,7 @@ case "$command_name" in
   current) build_current_platform ;;
   macos) build_macos_current ;;
   linux) build_linux_appdir ;;
-  windows) build_windows_exe ;;
+  windows) build_windows_package ;;
   check) run_checks ;;
   help | --help | -h) usage ;;
   quit) exit 0 ;;
