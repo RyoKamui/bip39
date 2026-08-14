@@ -3318,7 +3318,11 @@ fn action_button(ui: &mut egui::Ui, icon: UiIcon, label: &str, primary: bool) ->
         } else {
             egui::Color32::WHITE
         };
-        (fill, egui::Stroke::new(1.0_f32, border_color()), accent_color())
+        (
+            fill,
+            egui::Stroke::new(1.0_f32, border_color()),
+            accent_color(),
+        )
     };
     ui.painter()
         .rect(rect, 8.0, fill, stroke, egui::StrokeKind::Inside);
