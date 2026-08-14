@@ -105,7 +105,7 @@ Exec="\$APPDIR/AppRun"
 Terminal=false
 Categories=Utility;Finance;
 StartupNotify=true
-Icon=$APPDIR/usr/share/icons/hicolor/256x256/apps/$desktop_id.png
+Icon=\$APPDIR/usr/share/icons/hicolor/256x256/apps/$desktop_id.png
 DESKTOP
 
 chmod 644 "\$desktop_file"

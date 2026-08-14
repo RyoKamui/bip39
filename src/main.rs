@@ -6297,12 +6297,14 @@ fn persist_noclobber(path: &Path, contents: &[u8]) -> Result<(), String> {
     sync_parent_directory(parent)
 }
 
-fn sync_parent_directory(parent: &Path) -> Result<(), String> {
+fn sync_parent_directory(_parent: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
-        std::fs::File::open(parent)
+        std::fs::File::open(_parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("Failed to finish saving in {}: {error}", parent.display()))?;
+            .map_err(|error| {
+                format!("Failed to finish saving in {}: {error}", _parent.display())
+            })?;
     }
     Ok(())
 }
