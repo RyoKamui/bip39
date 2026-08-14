@@ -6541,7 +6541,9 @@ mod tests {
     fn bundled_age_next_to_application_binary_is_preferred_over_path() {
         let tempdir = tempfile::tempdir().unwrap();
         let executable = tempdir.path().join("bip39");
-        let bundled_age = tempdir.path().join("age");
+        let bundled_age = tempdir
+            .path()
+            .join(age_executable_name(std::env::consts::OS));
         std::fs::write(&bundled_age, b"bundled age").unwrap();
 
         assert_eq!(
@@ -6554,7 +6556,9 @@ mod tests {
     fn verified_age_update_is_preferred_over_bundled_binary() {
         let tempdir = tempfile::tempdir().unwrap();
         let executable = tempdir.path().join("bip39");
-        let bundled_age = tempdir.path().join("age");
+        let bundled_age = tempdir
+            .path()
+            .join(age_executable_name(std::env::consts::OS));
         let updated_age = tempdir.path().join("updated-age");
         std::fs::write(bundled_age, b"bundled age").unwrap();
         std::fs::write(&updated_age, b"updated age").unwrap();
@@ -6569,7 +6573,13 @@ mod tests {
     fn configured_age_binary_overrides_bundled_binary() {
         let tempdir = tempfile::tempdir().unwrap();
         let executable = tempdir.path().join("bip39");
-        std::fs::write(tempdir.path().join("age"), b"bundled age").unwrap();
+        std::fs::write(
+            tempdir
+                .path()
+                .join(age_executable_name(std::env::consts::OS)),
+            b"bundled age",
+        )
+        .unwrap();
         let configured = OsString::from("/custom/age");
 
         assert_eq!(
