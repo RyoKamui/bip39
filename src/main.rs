@@ -2227,25 +2227,25 @@ fn configure_ui_style(context: &egui::Context) {
     visuals.text_edit_bg_color = Some(egui::Color32::WHITE);
     visuals.faint_bg_color = egui::Color32::from_rgb(247, 249, 251);
     visuals.selection.bg_fill = accent_color();
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
     visuals.hyperlink_color = accent_color();
     visuals.warn_fg_color = warning_color();
     visuals.error_fg_color = error_color();
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_color());
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border_color());
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_color());
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, border_color());
     visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(243, 246, 249);
     visuals.widgets.inactive.bg_fill = egui::Color32::WHITE;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border_color());
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border_color());
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
     visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(229, 241, 240);
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(247, 252, 251);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent_color());
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, accent_color());
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, accent_color());
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5_f32, accent_color());
     visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
     visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(207, 232, 229);
     visuals.widgets.active.bg_fill = egui::Color32::from_rgb(229, 241, 240);
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent_color());
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, accent_color());
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, accent_color());
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5_f32, accent_color());
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
     style.visuals = visuals;
     context.set_global_style(style);
@@ -2311,7 +2311,7 @@ fn brand_header(ui: &mut egui::Ui, language: GuidanceLanguage) {
         ui.painter().rect_stroke(
             rect,
             11.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(49, 109, 116)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(49, 109, 116)),
             egui::StrokeKind::Inside,
         );
         paint_fortress_mark(ui.painter(), rect.shrink(5.0));
@@ -2609,7 +2609,7 @@ fn paint_more_below_hint<R>(
         hint_rect,
         19.0,
         egui::Color32::from_rgb(8, 104, 99),
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(94, 234, 212)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(94, 234, 212)),
         egui::StrokeKind::Inside,
     );
     ui.painter().text(
@@ -2621,7 +2621,7 @@ fn paint_more_below_hint<R>(
     );
     let arrow_x = hint_rect.right() - 24.0;
     let arrow_y = hint_rect.center().y + arrow_bob;
-    let stroke = egui::Stroke::new(1.8, egui::Color32::from_rgb(153, 246, 228));
+    let stroke = egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(153, 246, 228));
     ui.painter().line_segment(
         [
             egui::pos2(arrow_x, arrow_y - 4.0),
@@ -2654,7 +2654,7 @@ fn section_card(
 ) {
     egui::Frame::new()
         .fill(surface_color())
-        .stroke(egui::Stroke::new(1.0, border_color()))
+        .stroke(egui::Stroke::new(1.0_f32, border_color()))
         .corner_radius(12.0)
         .inner_margin(egui::Margin::same(18))
         .show(ui, |ui| {
@@ -2702,7 +2702,11 @@ fn action_button(ui: &mut egui::Ui, icon: UiIcon, label: &str, primary: bool) ->
         } else {
             egui::Color32::WHITE
         };
-        (fill, egui::Stroke::new(1.0, border_color()), accent_color())
+        (
+            fill,
+            egui::Stroke::new(1.0_f32, border_color()),
+            accent_color(),
+        )
     };
     ui.painter()
         .rect(rect, 8.0, fill, stroke, egui::StrokeKind::Inside);
@@ -2725,7 +2729,7 @@ fn action_button(ui: &mut egui::Ui, icon: UiIcon, label: &str, primary: bool) ->
 fn metadata_chip(ui: &mut egui::Ui, text: &str) {
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(241, 245, 249))
-        .stroke(egui::Stroke::new(1.0, border_color()))
+        .stroke(egui::Stroke::new(1.0_f32, border_color()))
         .corner_radius(12.0)
         .inner_margin(egui::Margin::symmetric(9, 5))
         .show(ui, |ui| {
@@ -2741,7 +2745,7 @@ fn success_chip(ui: &mut egui::Ui, text: &str) {
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(236, 253, 245))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgb(167, 243, 208),
         ))
         .corner_radius(12.0)
@@ -3150,7 +3154,7 @@ fn tips_panel(ui: &mut egui::Ui, tab: Tab, language: GuidanceLanguage) {
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(238, 247, 246))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             egui::Color32::from_rgb(186, 224, 220),
         ))
         .corner_radius(10.0)
@@ -4266,7 +4270,7 @@ fn status_banner(ui: &mut egui::Ui, status: &str) {
     };
     egui::Frame::new()
         .fill(background)
-        .stroke(egui::Stroke::new(1.0, border))
+        .stroke(egui::Stroke::new(1.0_f32, border))
         .corner_radius(8.0)
         .inner_margin(egui::Margin::symmetric(12, 9))
         .show(ui, |ui| {
