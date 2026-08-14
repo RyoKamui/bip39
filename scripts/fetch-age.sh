@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
-age_version="1.3.1"
+age_version="$(tr -d '[:space:]' < "$repo_root/AGE_VERSION")"
 requested_os="${1:-}"
 requested_arch="${2:-$(uname -m)}"
 
@@ -13,6 +13,7 @@ case "$requested_os:$requested_arch" in
     release_arch="arm64"
     archive_extension="tar.gz"
     executable_name="age"
+    keygen_name="age-keygen"
     expected_sha256="01120ea2cbf0463d4c6bd767f99f3271bbed1cdc8a9aa718a76ba1fe4f01998b"
     ;;
   darwin:x86_64 | darwin:amd64 | macos:x86_64 | macos:amd64)
@@ -20,6 +21,7 @@ case "$requested_os:$requested_arch" in
     release_arch="amd64"
     archive_extension="tar.gz"
     executable_name="age"
+    keygen_name="age-keygen"
     expected_sha256="2b233301ad21ab7b1eabd9ae1198a164005fa4928fcdd745d47c39f8593209d7"
     ;;
   linux:x86_64 | linux:amd64)
@@ -27,6 +29,7 @@ case "$requested_os:$requested_arch" in
     release_arch="amd64"
     archive_extension="tar.gz"
     executable_name="age"
+    keygen_name="age-keygen"
     expected_sha256="bdc69c09cbdd6cf8b1f333d372a1f58247b3a33146406333e30c0f26e8f51377"
     ;;
   linux:arm64 | linux:aarch64)
@@ -34,6 +37,7 @@ case "$requested_os:$requested_arch" in
     release_arch="arm64"
     archive_extension="tar.gz"
     executable_name="age"
+    keygen_name="age-keygen"
     expected_sha256="c6878a324421b69e3e20b00ba17c04bc5c6dab0030cfe55bf8f68fa8d9e9093a"
     ;;
   windows:x86_64 | windows:amd64)
@@ -41,6 +45,7 @@ case "$requested_os:$requested_arch" in
     release_arch="amd64"
     archive_extension="zip"
     executable_name="age.exe"
+    keygen_name="age-keygen.exe"
     expected_sha256="c56e8ce22f7e80cb85ad946cc82d198767b056366201d3e1a2b93d865be38154"
     ;;
   *)
@@ -78,13 +83,19 @@ if [[ ! -f "$archive_path" ]] || [[ "$(sha256_file "$archive_path")" != "$expect
   trap - EXIT
 fi
 
-if [[ ! -x "$bundle_dir/$executable_name" ]] || [[ ! -f "$bundle_dir/LICENSE" ]]; then
+if [[ ! -x "$bundle_dir/$executable_name" ]] \
+  || [[ ! -x "$bundle_dir/$keygen_name" ]] \
+  || [[ ! -f "$bundle_dir/LICENSE" ]]; then
   temp_extract="$(mktemp -d "$cache_dir/extract.XXXXXX")"
   trap 'rm -rf "$temp_extract"' EXIT
-  tar -xf "$archive_path" -C "$temp_extract" "age/$executable_name" age/LICENSE
+  tar -xf "$archive_path" -C "$temp_extract" \
+    "age/$executable_name" \
+    "age/$keygen_name" \
+    age/LICENSE
   rm -rf "$bundle_dir"
   mv "$temp_extract/age" "$bundle_dir"
   chmod 755 "$bundle_dir/$executable_name"
+  chmod 755 "$bundle_dir/$keygen_name"
   trap - EXIT
   rmdir "$temp_extract"
 fi
@@ -93,6 +104,7 @@ host_system="$(uname -s)"
 case "$release_os:$host_system" in
   darwin:Darwin | linux:Linux | windows:MINGW* | windows:MSYS* | windows:CYGWIN*)
     "$bundle_dir/$executable_name" --version >&2
+    "$bundle_dir/$keygen_name" --version >&2
     ;;
   *)
     echo "Verified age v$age_version archive for $release_os-$release_arch (launch test deferred to target OS)." >&2

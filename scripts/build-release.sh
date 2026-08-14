@@ -71,7 +71,8 @@ build_macos_current() {
   run "$script_dir/check-binary-paths.sh" \
     "target/release/$bin_name" \
     "$mac_app_path/Contents/MacOS/$bin_name" \
-    "$mac_app_path/Contents/MacOS/age"
+    "$mac_app_path/Contents/MacOS/age" \
+    "$mac_app_path/Contents/MacOS/age-keygen"
 
   echo
   echo "Built macOS app:"
@@ -95,7 +96,8 @@ build_linux_appdir() {
   run "$script_dir/check-binary-paths.sh" \
     "target/release/$bin_name" \
     "$linux_appdir_path/usr/bin/$bin_name" \
-    "$linux_appdir_path/usr/bin/age"
+    "$linux_appdir_path/usr/bin/age" \
+    "$linux_appdir_path/usr/bin/age-keygen"
 
   echo
   echo "Built Linux AppDir:"
@@ -119,7 +121,8 @@ build_windows_package() {
   run "$script_dir/check-binary-paths.sh" \
     "target/release/$bin_name.exe" \
     "$windows_package_path/$app_name.exe" \
-    "$windows_package_path/age.exe"
+    "$windows_package_path/age.exe" \
+    "$windows_package_path/age-keygen.exe"
 
   echo
   echo "Built Windows package:"

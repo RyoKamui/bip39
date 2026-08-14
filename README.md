@@ -60,18 +60,21 @@ Raw `cargo build --release` without path-remap rustflags is blocked unless `BIP3
 
 GitHub Actions builds native artifacts on each OS:
 
-- `bip39-tool-macos`: Apple Silicon macOS app bundle zip
-- `bip39-tool-linux`: Linux AppDir tarball
-- `bip39-tool-windows`: Windows GUI package zip
+- `bip39-tool-macos-aarch64` and `bip39-tool-macos-x86_64`: Apple Silicon and Intel macOS app bundle zips
+- `bip39-tool-linux-aarch64` and `bip39-tool-linux-x86_64`: ARM64 and x86-64 Linux AppDir tarballs
+- `bip39-tool-windows-x86_64`: x86-64 Windows GUI package zip
 - raw binary artifacts for macOS, Linux, and Windows are also uploaded for debugging
+
+macOS CI supports Developer ID signing and notarization when the repository provides `APPLE_CERTIFICATE_P12`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_DEVELOPER_ID_APPLICATION`, `APPLE_NOTARY_ID`, `APPLE_NOTARY_PASSWORD`, and `APPLE_TEAM_ID` secrets. Without them, development artifacts are ad-hoc signed and are not suitable for public Gatekeeper distribution.
 
 Windows release builds use the Windows GUI subsystem, so double-clicking `bip39.exe` should open the GUI without a console window.
 
 ## Requirements
 
 - Rust stable.
-- Every packaged macOS, Linux, and Windows app includes a pinned, checksum-verified `age` executable and its BSD-3-Clause license.
-- On startup, the app checks the official age GitHub release at most once per day. A newer platform build is downloaded into the per-user data directory, checked against the release asset's SHA-256 digest, launch-tested, and then preferred over the bundled offline fallback. The signed app package itself is not modified.
+- Every packaged macOS, Linux, and Windows app includes pinned, checksum-verified `age` and `age-keygen` executables plus the age BSD-3-Clause license. `AGE_VERSION` is the single source of truth for the bundled version.
+- On every startup, a background task checks the official age GitHub release with network timeouts. A newer platform archive is downloaded into the per-user data directory, checked against GitHub's release-asset SHA-256 digest, launch-tested, and then preferred over the bundled offline fallback. Before every use, the cached executable is re-hashed against the authenticated archive; arbitrary version-named files in the cache are never selected. The signed app package itself is not modified.
+- Automatic-update failures are visible in the sidebar; the bundled executable remains available offline.
 - Running a raw standalone binary still falls back to an `age` command on `PATH` if neither an updated nor adjacent bundled executable exists.
 - Optional: set `BIP39_AGE_BINARY=/absolute/path/to/age` to override the bundled or PATH-resolved executable with a specific trusted `age` binary.
 
@@ -92,9 +95,12 @@ The app opens at 1240 × 860 pixels and remains usable down to 960 × 680. Creat
 - Generate a new 24-word BIP-39 mnemonic using OS randomness, or import an existing valid BIP-39 seed phrase.
 - Choose the BIP-39 language before generation.
 - Enter an optional BIP-39 passphrase and choose whether to include it in the encrypted backup.
+- Confirm non-empty passphrases to catch typing errors. BIP-39 itself cannot determine whether a passphrase belongs to a particular wallet because every passphrase produces a valid but different wallet.
 - Save an age-encrypted backup by pasting a public recipient or selecting a recipient file.
+- Confirm that the matching private identity is under your control, or create a new local identity with the packaged `age-keygen`; the matching public recipient is filled automatically.
 - Enable SSKR to save recovery shares instead of the raw seed phrase.
 - Choose SSKR group count, group threshold, shares per group, and required shares per group.
+- Optionally export one private share per file as an atomically published recovery set. Distribute those files to separate trusted locations; keeping the complete set together does not provide loss redundancy.
 
 ### Open Backup
 
@@ -102,8 +108,10 @@ The app opens at 1240 × 860 pixels and remains usable down to 960 × 680. Creat
 - Paste a literal `AGE-SECRET-KEY-...` identity or select an identity file.
 - View the decrypted JSON in a structured, human-readable layout.
 - Sensitive fields are masked until explicitly revealed.
+- Unknown JSON fields are treated as sensitive and masked by default.
 - SSKR backups are recovered automatically after decryption; the reconstructed phrase appears in the summary when sensitive values are revealed.
 - Decrypted mnemonic and SSKR backups are loaded into address derivation automatically.
+- Direct mnemonic backups are revalidated for wordlist and checksum before they are accepted. Backups with missing or unsupported language metadata are rejected rather than silently treated as English.
 
 ### Recover SSKR
 
@@ -140,8 +148,11 @@ New backups do not store derived BIP-39 seed bytes, root XPRV values, or derived
 ## Security Notes
 
 - Mnemonics and SSKR shares are generated from OS randomness.
-- Save operations use no-clobber file creation and refuse existing files, directory targets, target symlinks, and symlink parent directories.
+- User-entered mnemonics and mnemonic-form SSKR shares are normalized according to BIP-39 before validation, including visually equivalent Japanese input.
+- Save operations write and sync a private temporary file before atomically publishing it without clobbering. Existing files, directory targets, target symlinks, and symlinked parent ancestors are refused.
+- Encryption and decryption run outside the GUI thread with 60-second process timeouts and bounded ciphertext, plaintext, diagnostic, recipient-file, release-metadata, and updater-archive reads.
 - Private age identities can be pasted directly for decryption; public recipients are rejected in identity fields.
-- Sensitive GUI state can be cleared with `Clear Sensitive Data`.
+- Sensitive GUI state can be cleared with `Clear Sensitive Data`; an in-flight encryption, decryption, or identity-generation worker is cancelled and its result is discarded.
+- Seed phrases, passphrases, identities, decrypted values, and recovery shares default to masked; clearing sensitive state also resets every reveal control.
 - In-memory sensitive strings and decrypted JSON are zeroized where the Rust types allow it, but a desktop GUI can still expose secrets to OS-level memory inspection, screenshots, clipboard history, accessibility tooling, and swap. Use this on a trusted machine.
 - Backup encryption strength and `age1pq...` support depend on the selected `age` binary. All platform packages ship the version documented by `scripts/fetch-age.sh`; this app shells out to `age` and does not implement AES-256-GCM or Argon2 itself.

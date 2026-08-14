@@ -4,12 +4,16 @@
 )]
 
 use std::{
+    borrow::Cow,
     ffi::OsString,
-    fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, SystemTime},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex, OnceLock, RwLock,
+    },
+    time::{Duration, Instant},
 };
 
 use bip39::{Language, Mnemonic};
@@ -30,21 +34,64 @@ use tiny_keccak::Hasher;
 use zeroize::{Zeroize, Zeroizing};
 
 const DEFAULT_BACKUP_FILE: &str = "seed_backup.json.age";
-const FORM_LABEL_WIDTH: f32 = 148.0;
-const FORM_BUTTON_WIDTH: f32 = 118.0;
-const FIELD_HEIGHT: f32 = 34.0;
+const FORM_LABEL_WIDTH: f32 = 164.0;
+const FORM_BUTTON_WIDTH: f32 = 128.0;
+const FIELD_HEIGHT: f32 = 40.0;
 const MAX_DERIVE_COUNT: u32 = 100;
 const MAX_SSKR_GROUPS: u8 = 16;
 const MAX_SSKR_SHARES_PER_GROUP: u8 = 16;
 const BACKUP_SCHEMA_VERSION: u32 = 2;
 const BIP32_HARDENED_OFFSET: u32 = 1 << 31;
-const BUNDLED_AGE_VERSION: &str = "1.3.1";
+const BUNDLED_AGE_VERSION: &str = include_str!("../AGE_VERSION");
 const AGE_RELEASE_API: &str = "https://api.github.com/repos/FiloSottile/age/releases/latest";
 const AGE_DOWNLOAD_PREFIX: &str = "https://github.com/FiloSottile/age/releases/download/";
-const AGE_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_AGE_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_AGE_EXECUTABLE_BYTES: u64 = 24 * 1024 * 1024;
 const MAX_AGE_LICENSE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_AGE_DIAGNOSTIC_BYTES: u64 = 1024 * 1024;
+const MAX_AGE_RELEASE_METADATA_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_RECIPIENT_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_BACKUP_CIPHERTEXT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_BACKUP_PLAINTEXT_BYTES: u64 = 16 * 1024 * 1024;
+const AGE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+static TRUSTED_UPDATED_AGE: OnceLock<RwLock<Option<TrustedAgeBinary>>> = OnceLock::new();
+static AGE_UPDATE_STATUS: OnceLock<Mutex<AgeUpdateStatus>> = OnceLock::new();
+
+#[derive(Clone)]
+enum AgeUpdateStatus {
+    Checking,
+    Bundled,
+    Updated(String),
+    Failed(String),
+}
+
+#[derive(Clone)]
+struct TrustedAgeBinary {
+    path: PathBuf,
+    sha256: [u8; 32],
+}
+
+enum WorkerMessage {
+    Save {
+        path: PathBuf,
+        sskr: bool,
+        result: Result<Option<PathBuf>, String>,
+    },
+    Decrypt(Result<Zeroizing<Vec<u8>>, String>),
+    Identity {
+        path: PathBuf,
+        result: Result<String, String>,
+    },
+}
+
+struct SskrExportPlan {
+    parent: PathBuf,
+    directory_name: String,
+    files: Vec<(String, Zeroizing<String>)>,
+    recovery_rule: String,
+    mnemonic_language: String,
+}
 
 fn embedded_app_icon() -> egui::IconData {
     eframe::icon_data::from_png_bytes(include_bytes!("../assets/bip39-tool-icon-256.png"))
@@ -54,8 +101,8 @@ fn embedded_app_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1240.0, 860.0])
-            .with_min_inner_size([960.0, 680.0])
+            .with_inner_size([1320.0, 900.0])
+            .with_min_inner_size([1040.0, 720.0])
             .with_icon(embedded_app_icon()),
         ..Default::default()
     };
@@ -195,6 +242,10 @@ impl SensitiveJson {
 
     fn as_value(&self) -> &serde_json::Value {
         &self.value
+    }
+
+    fn as_value_mut(&mut self) -> &mut serde_json::Value {
+        &mut self.value
     }
 }
 
@@ -376,7 +427,10 @@ impl GuidanceLanguage {
                 "Generate seed" => "生成助记词",
                 "Seed phrase" => "助记词",
                 "Reveal generated phrase" => "显示生成的助记词",
+                "Reveal seed phrase" => "显示助记词",
                 "Passphrase" => "附加密码",
+                "Confirm passphrase" => "再次输入附加密码",
+                "Enter the same passphrase again" => "再次输入完全相同的附加密码",
                 "Optional BIP-39 passphrase" => "BIP-39 附加密码（可选）",
                 "Reveal passphrase" => "显示附加密码",
                 "Include passphrase in encrypted backup" => "将附加密码写入加密备份",
@@ -390,14 +444,28 @@ impl GuidanceLanguage {
                 "Require" => "门限",
                 "Shares per group" => "每组份额数",
                 "Recovery rule" => "恢复门限",
+                "Separate storage" => "分开保管",
+                "Export each SSKR share as a separate file" => "将每份 SSKR 份额导出为独立文件",
+                "Export folder" => "导出位置",
+                "Choose folder" => "选择文件夹",
+                "Choose SSKR export folder" => "选择 SSKR 份额导出文件夹",
                 "Encrypt and save" => "加密并保存",
                 "Select who can decrypt the backup and where the encrypted file is written." => {
                     "指定用于加密的 age 接收公钥，并选择备份文件的保存位置。"
                 }
                 "Recipient" => "age 接收公钥",
+                "I verified that I control this recipient's private identity" => "我已确认自己持有该接收公钥对应的私钥",
                 "Choose file" => "选择文件",
                 "Backup file" => "备份文件",
                 "Save as" => "另存为",
+                "Need a key? Create a private age identity locally; its public recipient will be filled in automatically." => {
+                    "还没有密钥？可在本机创建 age 私钥，应用会自动填入对应的接收公钥。"
+                }
+                "New identity file" => "新建私钥文件",
+                "Create age identity" => "创建 age 私钥",
+                "Save private age identity" => "保存 age 私钥",
+                "Identity file" => "私钥文件",
+                "Creating age identity…" => "正在创建 age 私钥…",
                 "Unlock backup" => "解密备份",
                 "Choose the encrypted file and supply a matching private age identity." => {
                     "选择加密备份，并提供与接收公钥匹配的 age 解密私钥。"
@@ -419,6 +487,7 @@ impl GuidanceLanguage {
                 }
                 "Share language" => "份额语言",
                 "SSKR shares" => "SSKR 份额",
+                "Reveal recovery shares" => "显示恢复份额",
                 "Wallet passphrase" => "BIP-39 附加密码",
                 "Enter the original BIP-39 passphrase if this wallet used one." => {
                     "如果创建钱包时使用了 BIP-39 附加密码，请在此输入完全相同的内容。"
@@ -429,6 +498,10 @@ impl GuidanceLanguage {
                     "使用已载入的备份，或手动粘贴有效的 BIP-39 助记词。"
                 }
                 "Network" => "网络",
+                "Address type" => "地址类型",
+                "A hardened final index is nonstandard and may not match common wallets." => {
+                    "末级索引硬化并非通用标准，派生结果可能与常见钱包不一致。"
+                }
                 "Index range" => "索引范围",
                 "Start" => "开始",
                 "End" => "结束",
@@ -482,9 +555,15 @@ impl GuidanceLanguage {
                 "Backup decrypted and seed loaded into address derivation." => {
                     "备份已解密，助记词已载入地址派生页面。"
                 }
+                "Backup decrypted and seed loaded. No passphrase was stored; enter the original passphrase before deriving if one was used." => {
+                    "备份已解密并载入助记词。备份中未保存附加密码；如果原钱包使用过附加密码，请在派生前输入原密码。"
+                }
                 "Recovered SSKR seed loaded." => "已载入通过 SSKR 恢复的种子。",
                 "Backup decrypted, and the SSKR seed was recovered automatically." => {
                     "备份已解密，SSKR 种子已自动恢复。"
+                }
+                "Backup decrypted and SSKR seed recovered. No passphrase was stored; enter the original passphrase before deriving if one was used." => {
+                    "备份已解密并恢复 SSKR 种子。备份中未保存附加密码；如果原钱包使用过附加密码，请在派生前输入原密码。"
                 }
                 "Backup decrypted, but it does not contain a seed phrase." => {
                     "备份已解密，但其中没有助记词。"
@@ -500,6 +579,9 @@ impl GuidanceLanguage {
                     "种子已恢复，并载入地址派生页面。"
                 }
                 "Sensitive GUI state cleared." => "已从内存中清除本次操作的敏感信息。",
+                "An operation is already in progress." => "已有一项操作正在进行，请稍候。",
+                "Encrypting backup…" => "正在加密备份…",
+                "Decrypting backup…" => "正在解密备份…",
                 "Error" => "错误",
                 _ => english,
             },
@@ -543,7 +625,10 @@ impl GuidanceLanguage {
                 "Generate seed" => "ニーモニックを生成",
                 "Seed phrase" => "ニーモニック",
                 "Reveal generated phrase" => "生成したニーモニックを表示",
+                "Reveal seed phrase" => "ニーモニックを表示",
                 "Passphrase" => "パスフレーズ",
+                "Confirm passphrase" => "パスフレーズを再入力",
+                "Enter the same passphrase again" => "同じパスフレーズをもう一度入力",
                 "Optional BIP-39 passphrase" => "任意の BIP-39 パスフレーズ",
                 "Reveal passphrase" => "パスフレーズを表示",
                 "Include passphrase in encrypted backup" => "暗号化バックアップに含める",
@@ -557,14 +642,28 @@ impl GuidanceLanguage {
                 "Require" => "しきい値",
                 "Shares per group" => "グループ内のシェア数",
                 "Recovery rule" => "復元しきい値",
+                "Separate storage" => "分散保管",
+                "Export each SSKR share as a separate file" => "各 SSKR シェアを個別ファイルに書き出す",
+                "Export folder" => "書き出し先",
+                "Choose folder" => "フォルダーを選択",
+                "Choose SSKR export folder" => "SSKR シェアの書き出し先を選択",
                 "Encrypt and save" => "暗号化して保存",
                 "Select who can decrypt the backup and where the encrypted file is written." => {
                     "暗号化先となる age 受信者公開鍵と、バックアップの保存先を指定します。"
                 }
                 "Recipient" => "age 受信者公開鍵",
+                "I verified that I control this recipient's private identity" => "この受信者公開鍵に対応する秘密鍵を保有していることを確認しました",
                 "Choose file" => "ファイルを選択",
                 "Backup file" => "バックアップファイル",
                 "Save as" => "別名で保存",
+                "Need a key? Create a private age identity locally; its public recipient will be filled in automatically." => {
+                    "鍵がない場合は、この端末で age 秘密鍵を作成できます。対応する受信者公開鍵は自動入力されます。"
+                }
+                "New identity file" => "新しい秘密鍵ファイル",
+                "Create age identity" => "age 秘密鍵を作成",
+                "Save private age identity" => "age 秘密鍵を保存",
+                "Identity file" => "秘密鍵ファイル",
+                "Creating age identity…" => "age 秘密鍵を作成しています…",
                 "Unlock backup" => "バックアップを復号",
                 "Choose the encrypted file and supply a matching private age identity." => {
                     "暗号化バックアップと、それに対応する age 秘密鍵を指定します。"
@@ -586,6 +685,7 @@ impl GuidanceLanguage {
                 }
                 "Share language" => "シェアの言語",
                 "SSKR shares" => "SSKR シェア",
+                "Reveal recovery shares" => "リカバリーシェアを表示",
                 "Wallet passphrase" => "BIP-39 パスフレーズ",
                 "Enter the original BIP-39 passphrase if this wallet used one." => {
                     "このウォレットで使用した元の BIP-39 パスフレーズを入力します。"
@@ -596,6 +696,10 @@ impl GuidanceLanguage {
                     "読み込んだバックアップを使うか、有効な BIP-39 ニーモニックを貼り付けます。"
                 }
                 "Network" => "ネットワーク",
+                "Address type" => "アドレス種別",
+                "A hardened final index is nonstandard and may not match common wallets." => {
+                    "末尾インデックスのハードニングは一般的ではなく、通常のウォレットと一致しない場合があります。"
+                }
                 "Index range" => "インデックス範囲",
                 "Start" => "開始",
                 "End" => "終了",
@@ -655,9 +759,15 @@ impl GuidanceLanguage {
                 "Backup decrypted and seed loaded into address derivation." => {
                     "バックアップを復号し、ニーモニックをアドレス導出画面に読み込みました。"
                 }
+                "Backup decrypted and seed loaded. No passphrase was stored; enter the original passphrase before deriving if one was used." => {
+                    "バックアップを復号してニーモニックを読み込みました。パスフレーズは保存されていません。使用していた場合は、導出前に元のパスフレーズを入力してください。"
+                }
                 "Recovered SSKR seed loaded." => "復元した SSKR シードを読み込みました。",
                 "Backup decrypted, and the SSKR seed was recovered automatically." => {
                     "バックアップを復号し、SSKR シードを自動復元しました。"
+                }
+                "Backup decrypted and SSKR seed recovered. No passphrase was stored; enter the original passphrase before deriving if one was used." => {
+                    "バックアップを復号して SSKR シードを復元しました。パスフレーズは保存されていません。使用していた場合は、導出前に元のパスフレーズを入力してください。"
                 }
                 "Backup decrypted, but it does not contain a seed phrase." => {
                     "バックアップを復号しましたが、ニーモニックが含まれていません。"
@@ -677,6 +787,9 @@ impl GuidanceLanguage {
                     "シードを復元し、アドレス導出に読み込みました。"
                 }
                 "Sensitive GUI state cleared." => "この操作で使用した機密情報をメモリから消去しました。",
+                "An operation is already in progress." => "別の処理を実行中です。完了までお待ちください。",
+                "Encrypting backup…" => "バックアップを暗号化しています…",
+                "Decrypting backup…" => "バックアップを復号しています…",
                 "Error" => "エラー",
                 _ => english,
             },
@@ -720,7 +833,10 @@ impl GuidanceLanguage {
                 "Generate seed" => "니모닉 생성",
                 "Seed phrase" => "니모닉",
                 "Reveal generated phrase" => "생성된 니모닉 표시",
+                "Reveal seed phrase" => "니모닉 표시",
                 "Passphrase" => "패스프레이즈",
+                "Confirm passphrase" => "패스프레이즈 확인",
+                "Enter the same passphrase again" => "같은 패스프레이즈를 다시 입력",
                 "Optional BIP-39 passphrase" => "BIP-39 패스프레이즈(선택 사항)",
                 "Reveal passphrase" => "패스프레이즈 표시",
                 "Include passphrase in encrypted backup" => "암호화 백업에 패스프레이즈 포함",
@@ -734,14 +850,28 @@ impl GuidanceLanguage {
                 "Require" => "임계값",
                 "Shares per group" => "그룹당 조각 수",
                 "Recovery rule" => "복구 임계값",
+                "Separate storage" => "분리 보관",
+                "Export each SSKR share as a separate file" => "각 SSKR 조각을 별도 파일로 내보내기",
+                "Export folder" => "내보낼 폴더",
+                "Choose folder" => "폴더 선택",
+                "Choose SSKR export folder" => "SSKR 조각 내보내기 폴더 선택",
                 "Encrypt and save" => "암호화 및 저장",
                 "Select who can decrypt the backup and where the encrypted file is written." => {
                     "암호화에 사용할 age 수신자 공개 키와 백업 파일의 저장 위치를 지정하세요."
                 }
                 "Recipient" => "age 수신자 공개 키",
+                "I verified that I control this recipient's private identity" => "이 수신자 공개 키에 해당하는 개인 키를 보유하고 있음을 확인했습니다",
                 "Choose file" => "파일 선택",
                 "Backup file" => "백업 파일",
                 "Save as" => "다른 이름으로 저장",
+                "Need a key? Create a private age identity locally; its public recipient will be filled in automatically." => {
+                    "키가 없다면 이 기기에서 age 개인 키를 만들 수 있습니다. 해당 수신자 공개 키는 자동으로 입력됩니다."
+                }
+                "New identity file" => "새 개인 키 파일",
+                "Create age identity" => "age 개인 키 만들기",
+                "Save private age identity" => "age 개인 키 저장",
+                "Identity file" => "개인 키 파일",
+                "Creating age identity…" => "age 개인 키 만드는 중…",
                 "Unlock backup" => "백업 복호화",
                 "Choose the encrypted file and supply a matching private age identity." => {
                     "암호화된 백업과 수신자 공개 키에 대응하는 age 개인 키를 지정하세요."
@@ -763,6 +893,7 @@ impl GuidanceLanguage {
                 }
                 "Share language" => "조각 언어",
                 "SSKR shares" => "SSKR 조각",
+                "Reveal recovery shares" => "복구 조각 표시",
                 "Wallet passphrase" => "BIP-39 패스프레이즈",
                 "Enter the original BIP-39 passphrase if this wallet used one." => {
                     "지갑을 만들 때 사용한 BIP-39 패스프레이즈를 정확히 입력하세요."
@@ -773,6 +904,10 @@ impl GuidanceLanguage {
                     "불러온 백업을 사용하거나 유효한 BIP-39 니모닉을 직접 붙여 넣으세요."
                 }
                 "Network" => "네트워크",
+                "Address type" => "주소 유형",
+                "A hardened final index is nonstandard and may not match common wallets." => {
+                    "마지막 인덱스 하드닝은 일반적인 표준이 아니므로 보편적인 지갑과 결과가 다를 수 있습니다."
+                }
                 "Index range" => "인덱스 범위",
                 "Start" => "시작",
                 "End" => "끝",
@@ -830,9 +965,15 @@ impl GuidanceLanguage {
                 "Backup decrypted and seed loaded into address derivation." => {
                     "백업을 복호화하고 니모닉을 주소 파생 화면에 불러왔습니다."
                 }
+                "Backup decrypted and seed loaded. No passphrase was stored; enter the original passphrase before deriving if one was used." => {
+                    "백업을 복호화하고 니모닉을 불러왔습니다. 패스프레이즈는 저장되어 있지 않습니다. 원래 지갑에서 사용했다면 파생 전에 기존 패스프레이즈를 입력하세요."
+                }
                 "Recovered SSKR seed loaded." => "복구된 SSKR 시드를 불러왔습니다.",
                 "Backup decrypted, and the SSKR seed was recovered automatically." => {
                     "백업을 복호화하고 SSKR 시드를 자동으로 복구했습니다."
+                }
+                "Backup decrypted and SSKR seed recovered. No passphrase was stored; enter the original passphrase before deriving if one was used." => {
+                    "백업을 복호화하고 SSKR 시드를 복구했습니다. 패스프레이즈는 저장되어 있지 않습니다. 원래 지갑에서 사용했다면 파생 전에 기존 패스프레이즈를 입력하세요."
                 }
                 "Backup decrypted, but it does not contain a seed phrase." => {
                     "백업을 복호화했지만 니모닉이 포함되어 있지 않습니다."
@@ -850,6 +991,9 @@ impl GuidanceLanguage {
                     "시드를 복구하고 주소 파생 화면에 불러왔습니다."
                 }
                 "Sensitive GUI state cleared." => "이 작업에 사용된 민감한 정보를 메모리에서 지웠습니다.",
+                "An operation is already in progress." => "다른 작업이 진행 중입니다. 완료될 때까지 기다려 주세요.",
+                "Encrypting backup…" => "백업을 암호화하는 중…",
+                "Decrypting backup…" => "백업을 복호화하는 중…",
                 "Error" => "오류",
                 _ => english,
             },
@@ -1063,17 +1207,22 @@ impl MnemonicLanguage {
     }
 
     fn from_backup_name(name: &str) -> Self {
+        Self::try_from_backup_name(name).unwrap_or(Self::English)
+    }
+
+    fn try_from_backup_name(name: &str) -> Option<Self> {
         match name {
-            "SimplifiedChinese" | "Simplified Chinese" => Self::SimplifiedChinese,
-            "TraditionalChinese" | "Traditional Chinese" => Self::TraditionalChinese,
-            "Japanese" => Self::Japanese,
-            "Korean" => Self::Korean,
-            "Spanish" => Self::Spanish,
-            "French" => Self::French,
-            "Italian" => Self::Italian,
-            "Czech" => Self::Czech,
-            "Portuguese" => Self::Portuguese,
-            _ => Self::English,
+            "English" => Some(Self::English),
+            "SimplifiedChinese" | "Simplified Chinese" => Some(Self::SimplifiedChinese),
+            "TraditionalChinese" | "Traditional Chinese" => Some(Self::TraditionalChinese),
+            "Japanese" => Some(Self::Japanese),
+            "Korean" => Some(Self::Korean),
+            "Spanish" => Some(Self::Spanish),
+            "French" => Some(Self::French),
+            "Italian" => Some(Self::Italian),
+            "Czech" => Some(Self::Czech),
+            "Portuguese" => Some(Self::Portuguese),
+            _ => None,
         }
     }
 }
@@ -1120,7 +1269,9 @@ struct Bip39Gui {
     language: MnemonicLanguage,
     generated_phrase: Zeroizing<String>,
     imported_phrase: Zeroizing<String>,
+    reveal_imported_phrase: bool,
     backup_passphrase: Zeroizing<String>,
+    backup_passphrase_confirmation: Zeroizing<String>,
     reveal_backup_passphrase: bool,
     store_passphrase: bool,
     reveal_generated: bool,
@@ -1129,7 +1280,11 @@ struct Bip39Gui {
     sskr_group_threshold: u8,
     sskr_shares_per_group: u8,
     sskr_required_shares_per_group: u8,
+    export_sskr_shares: bool,
+    sskr_export_parent: String,
     recipient_input: String,
+    recipient_confirmed: bool,
+    identity_save_path: String,
     save_path: String,
     generate_status: String,
     decrypt_path: String,
@@ -1141,11 +1296,13 @@ struct Bip39Gui {
     decrypt_status: String,
     recover_language: MnemonicLanguage,
     recover_shares_input: Zeroizing<String>,
+    reveal_recover_shares: bool,
     recover_passphrase: Zeroizing<String>,
     reveal_recover_passphrase: bool,
     recover_status: String,
     derive_language: MnemonicLanguage,
     derive_phrase: Zeroizing<String>,
+    reveal_derive_phrase: bool,
     derive_passphrase: Zeroizing<String>,
     reveal_derive_passphrase: bool,
     derive_kind: AddressKind,
@@ -1154,6 +1311,8 @@ struct Bip39Gui {
     derive_hardened: bool,
     address_rows: Vec<AddressRow>,
     derive_status: String,
+    worker_receiver: Option<mpsc::Receiver<WorkerMessage>>,
+    worker_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Bip39Gui {
@@ -1168,6 +1327,7 @@ impl Bip39Gui {
                 self.generate_status = language.text("Generated a new 24-word seed.").to_string();
                 self.derive_language = self.language;
                 self.derive_phrase = self.generated_phrase.clone();
+                self.reveal_derive_phrase = false;
                 self.derive_passphrase = self.backup_passphrase.clone();
                 self.address_rows.clear();
                 self.derive_status = language
@@ -1183,6 +1343,28 @@ impl Bip39Gui {
 
     fn save_seed_backup(&mut self) {
         let language = self.guidance_language;
+        if self.worker_receiver.is_some() {
+            self.generate_status = language
+                .text("An operation is already in progress.")
+                .to_string();
+            return;
+        }
+        if !self.recipient_confirmed {
+            self.generate_status = localized_error(
+                language,
+                "Confirm that you control the private identity for the selected recipient before saving.",
+            );
+            return;
+        }
+        if !self.backup_passphrase.is_empty()
+            && self.backup_passphrase.as_str() != self.backup_passphrase_confirmation.as_str()
+        {
+            self.generate_status = localized_error(
+                language,
+                "The BIP-39 passphrase and confirmation do not match.",
+            );
+            return;
+        }
         let phrase = self.seed_source.phrase(
             self.generated_phrase.as_str(),
             self.imported_phrase.as_str(),
@@ -1254,82 +1436,201 @@ impl Bip39Gui {
                 return;
             }
         };
+        let sskr_export_plan = if self.sskr_enabled && self.export_sskr_shares {
+            match prepare_sskr_export_plan(
+                &backup,
+                PathBuf::from(expand_tilde(self.sskr_export_parent.trim())),
+            ) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    backup.zeroize_sensitive();
+                    self.generate_status = localized_error(language, &error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         backup.zeroize_sensitive();
         let json = Zeroizing::new(json);
+        let sskr = self.sskr_enabled;
+        let worker_path = save_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.worker_cancel = Some(cancellation.clone());
+        self.worker_receiver = Some(receiver);
+        self.generate_status = language.text("Encrypting backup…").to_string();
+        std::thread::spawn(move || {
+            let result = encrypt_data(json.as_bytes(), &recipients, Some(&cancellation))
+                .and_then(|ciphertext| {
+                    ensure_not_cancelled(&cancellation)?;
+                    persist_noclobber(&worker_path, &ciphertext)
+                })
+                .and_then(|()| match sskr_export_plan {
+                    Some(plan) => {
+                        ensure_not_cancelled(&cancellation)?;
+                        export_sskr_shares_atomic(plan).map(Some).map_err(|error| {
+                            format!("The encrypted backup was saved, but the separate SSKR share export failed: {error}")
+                        })
+                    }
+                    None => Ok(None),
+                });
+            let _ = sender.send(WorkerMessage::Save {
+                path: worker_path,
+                sskr,
+                result,
+            });
+        });
+    }
 
-        match encrypt_data(json.as_bytes(), &recipients)
-            .and_then(|ciphertext| persist_noclobber(&save_path, &ciphertext))
-        {
-            Ok(()) => {
-                self.generate_status =
-                    localized_saved_status(language, self.sskr_enabled, &save_path);
-            }
-            Err(err) => {
-                self.generate_status = localized_error(language, &err);
-            }
+    fn create_age_identity(&mut self) {
+        let language = self.guidance_language;
+        if self.worker_receiver.is_some() {
+            self.generate_status = language
+                .text("An operation is already in progress.")
+                .to_string();
+            return;
         }
+        let path = if self.identity_save_path.trim().is_empty() {
+            PathBuf::from("age-identity.txt")
+        } else {
+            PathBuf::from(expand_tilde(self.identity_save_path.trim()))
+        };
+        if let Err(error) = validate_save_path(&path) {
+            self.generate_status = localized_error(language, &error);
+            return;
+        }
+        let worker_path = path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.worker_cancel = Some(cancellation.clone());
+        self.worker_receiver = Some(receiver);
+        self.generate_status = language.text("Creating age identity…").to_string();
+        std::thread::spawn(move || {
+            let result = generate_age_identity(&worker_path, Some(&cancellation));
+            let _ = sender.send(WorkerMessage::Identity {
+                path: worker_path,
+                result,
+            });
+        });
     }
 
     fn decrypt_backup(&mut self) {
         let ui_language = self.guidance_language;
-        let path = backup_save_path_from_input(&self.decrypt_path);
-        let ciphertext = match std::fs::read(&path) {
-            Ok(ciphertext) => ciphertext,
-            Err(err) => {
-                self.decrypt_status =
-                    localized_error(ui_language, &format!("{}: {err}", path.display()));
-                return;
-            }
-        };
-
-        let plaintext = match decrypt_data(&ciphertext, self.identity_input.as_str()) {
-            Ok(plaintext) => plaintext,
-            Err(err) => {
-                self.decrypt_status = localized_error(ui_language, &err);
-                return;
-            }
-        };
-
-        let backup_json = match serde_json::from_slice::<serde_json::Value>(plaintext.as_slice()) {
-            Ok(value) => value,
-            Err(err) => {
-                self.decrypt_status = localized_error(ui_language, &err.to_string());
-                return;
-            }
-        };
-
-        let language = MnemonicLanguage::from_backup_name(
-            json_string_field(&backup_json, "language").unwrap_or("English"),
-        );
-        let mut backup_summary = BackupSummary::from_json(&backup_json);
-        self.derive_language = language;
-        if let Some(seed_phrase) = json_string_field(&backup_json, "seed_phrase") {
-            self.derive_phrase = Zeroizing::new(seed_phrase.to_string());
-            self.derive_passphrase = Zeroizing::new(
-                json_string_field(&backup_json, "passphrase")
-                    .unwrap_or("")
-                    .to_string(),
-            );
-            self.derive_status = ui_language
-                .text("Address inputs loaded from the decrypted backup.")
-                .to_string();
+        if self.worker_receiver.is_some() {
             self.decrypt_status = ui_language
-                .text("Backup decrypted and seed loaded into address derivation.")
+                .text("An operation is already in progress.")
                 .to_string();
+            return;
+        }
+        self.clear_decrypted_state();
+        let path = backup_save_path_from_input(&self.decrypt_path);
+        let identity = self.identity_input.clone();
+        let (sender, receiver) = mpsc::channel();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.worker_cancel = Some(cancellation.clone());
+        self.worker_receiver = Some(receiver);
+        self.decrypt_status = ui_language.text("Decrypting backup…").to_string();
+        std::thread::spawn(move || {
+            let result = read_file_limited(&path, MAX_BACKUP_CIPHERTEXT_BYTES, "encrypted backup")
+                .and_then(|ciphertext| {
+                    decrypt_data(&ciphertext, identity.as_str(), Some(&cancellation))
+                });
+            let _ = sender.send(WorkerMessage::Decrypt(result));
+        });
+    }
+
+    fn load_decrypted_plaintext(&mut self, plaintext: Zeroizing<Vec<u8>>) {
+        let ui_language = self.guidance_language;
+
+        let mut backup_json =
+            match serde_json::from_slice::<serde_json::Value>(plaintext.as_slice()) {
+                Ok(value) => SensitiveJson::new(value),
+                Err(err) => {
+                    self.decrypt_status = localized_error(ui_language, &err.to_string());
+                    return;
+                }
+            };
+        if let Err(error) = validate_backup_envelope(backup_json.as_value()) {
+            self.decrypt_status = localized_error(ui_language, &error);
+            return;
+        }
+
+        let language_name = match json_string_field(backup_json.as_value(), "language") {
+            Some(language) => language,
+            None => {
+                self.decrypt_status = localized_error(
+                    ui_language,
+                    "The decrypted backup has no mnemonic language.",
+                );
+                return;
+            }
+        };
+        let language = match MnemonicLanguage::try_from_backup_name(language_name) {
+            Some(language) => language,
+            None => {
+                self.decrypt_status = localized_error(
+                    ui_language,
+                    &format!("The decrypted backup has an unsupported mnemonic language: {language_name}"),
+                );
+                return;
+            }
+        };
+        if let Some(seed_phrase) = json_string_field(backup_json.as_value(), "seed_phrase") {
+            let canonical = match parse_backup_mnemonic(language, seed_phrase) {
+                Ok(mnemonic) => mnemonic.to_string(),
+                Err(err) => {
+                    self.decrypt_status = localized_error(ui_language, &err);
+                    return;
+                }
+            };
+            if let Some(value) = backup_json.as_value_mut().get_mut("seed_phrase") {
+                *value = serde_json::Value::String(canonical);
+            }
+        }
+        let mut backup_summary = BackupSummary::from_json(backup_json.as_value());
+        self.derive_language = language;
+        if let Some(seed_phrase) = json_string_field(backup_json.as_value(), "seed_phrase") {
+            let stored_passphrase = json_string_field(backup_json.as_value(), "passphrase");
+            self.derive_phrase = Zeroizing::new(seed_phrase.to_string());
+            self.reveal_derive_phrase = false;
+            self.derive_passphrase = Zeroizing::new(stored_passphrase.unwrap_or("").to_string());
+            if stored_passphrase.is_some() {
+                self.derive_status = ui_language
+                    .text("Address inputs loaded from the decrypted backup.")
+                    .to_string();
+                self.decrypt_status = ui_language
+                    .text("Backup decrypted and seed loaded into address derivation.")
+                    .to_string();
+            } else {
+                let warning = ui_language.text(
+                    "Backup decrypted and seed loaded. No passphrase was stored; enter the original passphrase before deriving if one was used.",
+                );
+                self.derive_status = warning.to_string();
+                self.decrypt_status = warning.to_string();
+            }
         } else if backup_summary.sskr_groups > 0 {
-            self.derive_passphrase = Zeroizing::new(
-                json_string_field(&backup_json, "passphrase")
-                    .unwrap_or("")
-                    .to_string(),
-            );
-            match recover_mnemonic_from_backup_json(&backup_json, language) {
+            let stored_passphrase = json_string_field(backup_json.as_value(), "passphrase");
+            self.derive_passphrase = Zeroizing::new(stored_passphrase.unwrap_or("").to_string());
+            match recover_mnemonic_from_backup_json(backup_json.as_value(), language) {
                 Ok(mnemonic_phrase) => {
                     self.derive_phrase = mnemonic_phrase;
-                    self.derive_status =
-                        ui_language.text("Recovered SSKR seed loaded.").to_string();
-                    self.decrypt_status = ui_language
-                        .text("Backup decrypted, and the SSKR seed was recovered automatically.")
-                        .to_string();
+                    self.reveal_derive_phrase = false;
+                    if stored_passphrase.is_some() {
+                        self.derive_status =
+                            ui_language.text("Recovered SSKR seed loaded.").to_string();
+                        self.decrypt_status = ui_language
+                            .text(
+                                "Backup decrypted, and the SSKR seed was recovered automatically.",
+                            )
+                            .to_string();
+                    } else {
+                        let warning = ui_language.text(
+                            "Backup decrypted and SSKR seed recovered. No passphrase was stored; enter the original passphrase before deriving if one was used.",
+                        );
+                        self.derive_status = warning.to_string();
+                        self.decrypt_status = warning.to_string();
+                    }
                     backup_summary.recovered_from_sskr = true;
                 }
                 Err(err) => {
@@ -1350,8 +1651,76 @@ impl Bip39Gui {
                 .to_string();
         }
         self.decrypted_backup = Some(backup_summary);
-        self.decrypted_backup_json = Some(SensitiveJson::new(backup_json));
+        self.decrypted_backup_json = Some(backup_json);
         self.address_rows.clear();
+    }
+
+    fn poll_worker(&mut self, context: &egui::Context) {
+        let message = match self.worker_receiver.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(message)) => Some(message),
+            Some(Err(mpsc::TryRecvError::Empty)) | None => None,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.worker_receiver = None;
+                self.worker_cancel = None;
+                let status = localized_error(
+                    self.guidance_language,
+                    "The background operation stopped unexpectedly.",
+                );
+                match self.tab {
+                    Tab::Generate => self.generate_status = status,
+                    Tab::Decrypt => self.decrypt_status = status,
+                    Tab::Recover => self.recover_status = status,
+                    Tab::Addresses => self.derive_status = status,
+                }
+                context.request_repaint();
+                return;
+            }
+        };
+        let Some(message) = message else {
+            if self.worker_receiver.is_some() {
+                context.request_repaint_after(Duration::from_millis(50));
+            }
+            return;
+        };
+        self.worker_receiver = None;
+        self.worker_cancel = None;
+        match message {
+            WorkerMessage::Save { path, sskr, result } => match result {
+                Ok(export_path) => {
+                    self.generate_status =
+                        localized_saved_status(self.guidance_language, sskr, &path);
+                    if let Some(export_path) = export_path {
+                        self.generate_status.push_str(&localized_sskr_export_status(
+                            self.guidance_language,
+                            &export_path,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.generate_status = localized_error(self.guidance_language, &error);
+                }
+            },
+            WorkerMessage::Decrypt(result) => match result {
+                Ok(plaintext) => self.load_decrypted_plaintext(plaintext),
+                Err(error) => {
+                    self.clear_decrypted_state();
+                    self.decrypt_status = localized_error(self.guidance_language, &error);
+                }
+            },
+            WorkerMessage::Identity { path, result } => match result {
+                Ok(recipient) => {
+                    self.recipient_input = recipient;
+                    self.recipient_confirmed = true;
+                    self.identity_input = Zeroizing::new(path.display().to_string());
+                    self.generate_status =
+                        localized_identity_saved_status(self.guidance_language, &path);
+                }
+                Err(error) => {
+                    self.generate_status = localized_error(self.guidance_language, &error);
+                }
+            },
+        }
+        context.request_repaint();
     }
 
     fn derive_addresses(&mut self) {
@@ -1384,12 +1753,15 @@ impl Bip39Gui {
                 .to_string();
             return;
         }
-        if end - start + 1 > MAX_DERIVE_COUNT {
+        let count = end
+            .checked_sub(start)
+            .and_then(|difference| difference.checked_add(1));
+        if count.is_none_or(|count| count > MAX_DERIVE_COUNT) {
             self.derive_status = localized_max_address_status(language, MAX_DERIVE_COUNT);
             return;
         }
 
-        let mnemonic = match Mnemonic::parse_in_normalized(self.derive_language.bip39(), phrase) {
+        let mnemonic = match Mnemonic::parse_in(self.derive_language.bip39(), phrase) {
             Ok(mnemonic) => mnemonic,
             Err(err) => {
                 self.derive_status = localized_error(language, &err.to_string());
@@ -1430,6 +1802,7 @@ impl Bip39Gui {
             Ok(mnemonic_phrase) => {
                 self.derive_language = self.recover_language;
                 self.derive_phrase = mnemonic_phrase;
+                self.reveal_derive_phrase = false;
                 self.derive_passphrase = self.recover_passphrase.clone();
                 self.address_rows.clear();
                 self.recover_status = language
@@ -1446,17 +1819,26 @@ impl Bip39Gui {
     }
 
     fn clear_sensitive_state(&mut self) {
+        if let Some(cancellation) = self.worker_cancel.take() {
+            cancellation.store(true, Ordering::Release);
+        }
+        self.worker_receiver = None;
         self.generated_phrase.zeroize();
         self.imported_phrase.zeroize();
+        self.reveal_imported_phrase = false;
         self.backup_passphrase.zeroize();
+        self.backup_passphrase_confirmation.zeroize();
         self.reveal_backup_passphrase = false;
+        self.reveal_generated = false;
         self.identity_input.zeroize();
-        self.decrypted_backup = None;
-        self.decrypted_backup_json = None;
+        self.reveal_identity_input = false;
+        self.clear_decrypted_state();
         self.recover_shares_input.zeroize();
+        self.reveal_recover_shares = false;
         self.recover_passphrase.zeroize();
         self.reveal_recover_passphrase = false;
         self.derive_phrase.zeroize();
+        self.reveal_derive_phrase = false;
         self.derive_passphrase.zeroize();
         self.reveal_derive_passphrase = false;
         self.address_rows.clear();
@@ -1474,6 +1856,17 @@ impl Bip39Gui {
             Tab::Recover => self.recover_status = status,
             Tab::Addresses => self.derive_status = status,
         }
+    }
+
+    fn clear_decrypted_state(&mut self) {
+        self.decrypted_backup = None;
+        self.decrypted_backup_json = None;
+        self.reveal_decrypted = false;
+        self.derive_phrase.zeroize();
+        self.reveal_derive_phrase = false;
+        self.derive_passphrase.zeroize();
+        self.reveal_derive_passphrase = false;
+        self.address_rows.clear();
     }
 
     fn normalize_sskr_settings(&mut self) {
@@ -1525,7 +1918,9 @@ impl Default for Bip39Gui {
             language: MnemonicLanguage::English,
             generated_phrase: Zeroizing::new(String::new()),
             imported_phrase: Zeroizing::new(String::new()),
+            reveal_imported_phrase: false,
             backup_passphrase: Zeroizing::new(String::new()),
+            backup_passphrase_confirmation: Zeroizing::new(String::new()),
             reveal_backup_passphrase: false,
             store_passphrase: false,
             reveal_generated: false,
@@ -1534,7 +1929,11 @@ impl Default for Bip39Gui {
             sskr_group_threshold: 1,
             sskr_shares_per_group: 3,
             sskr_required_shares_per_group: 2,
+            export_sskr_shares: false,
+            sskr_export_parent: "./".to_string(),
             recipient_input: String::new(),
+            recipient_confirmed: false,
+            identity_save_path: "./age-identity.txt".to_string(),
             save_path: format!("./{DEFAULT_BACKUP_FILE}"),
             generate_status: String::new(),
             decrypt_path: format!("./{DEFAULT_BACKUP_FILE}"),
@@ -1546,11 +1945,13 @@ impl Default for Bip39Gui {
             decrypt_status: String::new(),
             recover_language: MnemonicLanguage::English,
             recover_shares_input: Zeroizing::new(String::new()),
+            reveal_recover_shares: false,
             recover_passphrase: Zeroizing::new(String::new()),
             reveal_recover_passphrase: false,
             recover_status: String::new(),
             derive_language: MnemonicLanguage::English,
             derive_phrase: Zeroizing::new(String::new()),
+            reveal_derive_phrase: false,
             derive_passphrase: Zeroizing::new(String::new()),
             reveal_derive_passphrase: false,
             derive_kind: AddressKind::Bitcoin,
@@ -1559,20 +1960,23 @@ impl Default for Bip39Gui {
             derive_hardened: false,
             address_rows: Vec::new(),
             derive_status: String::new(),
+            worker_receiver: None,
+            worker_cancel: None,
         }
     }
 }
 
 impl eframe::App for Bip39Gui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_worker(ui.ctx());
         let language = self.guidance_language;
         egui::Panel::left("navigation")
-            .exact_size(230.0)
+            .exact_size(252.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(sidebar_color())
-                    .inner_margin(egui::Margin::same(18)),
+                    .inner_margin(egui::Margin::same(20)),
             )
             .show_inside(ui, |ui| {
                 brand_header(ui, language);
@@ -1596,7 +2000,21 @@ impl eframe::App for Bip39Gui {
                         self.clear_sensitive_state();
                     }
                     ui.add_space(8.0);
-                    sidebar_status_row(ui, UiIcon::Shield, language.text("Secrets: memory only"));
+                    let _ = sidebar_status_row(
+                        ui,
+                        UiIcon::Shield,
+                        language.text("Secrets: memory only"),
+                    );
+                    ui.add_space(2.0);
+                    let (age_status, checking, update_error) =
+                        localized_age_update_status(language);
+                    let response = sidebar_status_row(ui, UiIcon::Arrow, &age_status);
+                    if let Some(error) = update_error {
+                        response.on_hover_text(error);
+                    }
+                    if checking {
+                        ui.ctx().request_repaint_after(Duration::from_millis(250));
+                    }
                 });
             });
 
@@ -1604,7 +2022,7 @@ impl eframe::App for Bip39Gui {
             .frame(
                 egui::Frame::new()
                     .fill(app_background_color())
-                    .inner_margin(egui::Margin::symmetric(30, 24)),
+                    .inner_margin(egui::Margin::symmetric(32, 26)),
             )
             .show_inside(ui, |ui| {
                 let language_changed = page_header(
@@ -1707,7 +2125,15 @@ impl Bip39Gui {
                         language.text("Seed phrase"),
                         &mut self.imported_phrase,
                         4,
+                        !self.reveal_imported_phrase,
                     );
+                    ui.horizontal(|ui| {
+                        form_label(ui, "");
+                        ui.checkbox(
+                            &mut self.reveal_imported_phrase,
+                            language.text("Reveal seed phrase"),
+                        );
+                    });
                 } else {
                     ui.horizontal(|ui| {
                         form_label(ui, language.text("Seed phrase"));
@@ -1737,6 +2163,17 @@ impl Bip39Gui {
                     {
                         self.derive_passphrase = self.backup_passphrase.clone();
                     }
+                });
+                ui.horizontal(|ui| {
+                    form_label(ui, language.text("Confirm passphrase"));
+                    let field_width = (ui.available_width() - 8.0).clamp(220.0, 460.0);
+                    ui.add_sized(
+                        [field_width, FIELD_HEIGHT],
+                        egui::TextEdit::singleline(&mut *self.backup_passphrase_confirmation)
+                            .password(!self.reveal_backup_passphrase)
+                            .hint_text(language.text("Enter the same passphrase again"))
+                            .desired_width(field_width),
+                    );
                 });
                 ui.horizontal_wrapped(|ui| {
                     form_label(ui, "");
@@ -1813,6 +2250,28 @@ impl Bip39Gui {
                             .color(accent_color()),
                         );
                     });
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        form_label(ui, language.text("Separate storage"));
+                        ui.checkbox(
+                            &mut self.export_sskr_shares,
+                            language.text("Export each SSKR share as a separate file"),
+                        );
+                    });
+                    if self.export_sskr_shares
+                        && text_field_row(
+                            ui,
+                            language.text("Export folder"),
+                            &mut self.sskr_export_parent,
+                            false,
+                            Some(language.text("Choose folder")),
+                        )
+                    {
+                        choose_existing_folder(
+                            language.text("Choose SSKR export folder"),
+                            &mut self.sskr_export_parent,
+                        );
+                    }
                 }
             },
         );
@@ -1827,6 +2286,7 @@ impl Bip39Gui {
             language
                 .text("Select who can decrypt the backup and where the encrypted file is written."),
             |ui| {
+                let previous_recipient = self.recipient_input.clone();
                 if text_field_row(
                     ui,
                     language.text("Recipient"),
@@ -1841,6 +2301,44 @@ impl Bip39Gui {
                         language,
                     );
                 }
+                if self.recipient_input != previous_recipient {
+                    self.recipient_confirmed = false;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    form_label(ui, "");
+                    ui.checkbox(
+                        &mut self.recipient_confirmed,
+                        language
+                            .text("I verified that I control this recipient's private identity"),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(language.text(
+                        "Need a key? Create a private age identity locally; its public recipient will be filled in automatically.",
+                    ))
+                    .size(14.0)
+                    .color(muted_text_color()),
+                );
+                if text_field_row(
+                    ui,
+                    language.text("New identity file"),
+                    &mut self.identity_save_path,
+                    false,
+                    Some(language.text("Save as")),
+                ) {
+                    choose_identity_save_file(&mut self.identity_save_path, language);
+                }
+                ui.horizontal(|ui| {
+                    form_label(ui, "");
+                    if action_button(ui, UiIcon::Key, language.text("Create age identity"), false)
+                        .clicked()
+                    {
+                        self.create_age_identity();
+                    }
+                });
                 if text_field_row(
                     ui,
                     language.text("Backup file"),
@@ -2016,7 +2514,15 @@ impl Bip39Gui {
                     language.text("SSKR shares"),
                     &mut self.recover_shares_input,
                     9,
+                    !self.reveal_recover_shares,
                 );
+                ui.horizontal(|ui| {
+                    form_label(ui, "");
+                    ui.checkbox(
+                        &mut self.reveal_recover_shares,
+                        language.text("Reveal recovery shares"),
+                    );
+                });
             },
         );
     }
@@ -2073,7 +2579,7 @@ impl Bip39Gui {
                     form_label(ui, language.text("Language"));
                     language_combo(ui, "derive_language", &mut self.derive_language, language);
                     ui.add_space(12.0);
-                    ui.label(language.text("Network"));
+                    ui.label(language.text("Address type"));
                     egui::ComboBox::from_id_salt("address_kind")
                         .selected_text(self.derive_kind.label())
                         .show_ui(ui, |ui| {
@@ -2089,7 +2595,20 @@ impl Bip39Gui {
                 });
 
                 ui.add_space(6.0);
-                multiline_text_row(ui, language.text("Seed phrase"), &mut self.derive_phrase, 4);
+                multiline_text_row(
+                    ui,
+                    language.text("Seed phrase"),
+                    &mut self.derive_phrase,
+                    4,
+                    !self.reveal_derive_phrase,
+                );
+                ui.horizontal(|ui| {
+                    form_label(ui, "");
+                    ui.checkbox(
+                        &mut self.reveal_derive_phrase,
+                        language.text("Reveal seed phrase"),
+                    );
+                });
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -2134,6 +2653,22 @@ impl Bip39Gui {
                         );
                     }
                 });
+                if self.derive_hardened
+                    && matches!(
+                        self.derive_kind,
+                        AddressKind::Bitcoin | AddressKind::Ethereum
+                    )
+                {
+                    ui.horizontal_wrapped(|ui| {
+                        form_label(ui, "");
+                        ui.colored_label(
+                            warning_color(),
+                            language.text(
+                                "A hardened final index is nonstandard and may not match common wallets.",
+                            ),
+                        );
+                    });
+                }
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -2207,25 +2742,43 @@ fn configure_ui_style(context: &egui::Context) {
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
+        .push(cjk_font_name.clone());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
         .push(cjk_font_name);
     context.set_fonts(fonts);
 
     let mut style = (*context.global_style()).clone();
-    style.spacing.item_spacing = egui::vec2(9.0, 8.0);
-    style.spacing.button_padding = egui::vec2(14.0, 8.0);
+    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+    style.spacing.button_padding = egui::vec2(16.0, 9.0);
     style.spacing.interact_size.y = FIELD_HEIGHT;
-    style.spacing.combo_width = 170.0;
-    style.spacing.text_edit_width = 320.0;
+    style.spacing.combo_width = 184.0;
+    style.spacing.text_edit_width = 340.0;
     style
         .text_styles
-        .insert(egui::TextStyle::Heading, egui::FontId::proportional(24.0));
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(13.5));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(15.5));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(27.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Monospace, egui::FontId::monospace(15.0));
 
     let mut visuals = egui::Visuals::light();
     visuals.panel_fill = app_background_color();
     visuals.window_fill = surface_color();
-    visuals.extreme_bg_color = egui::Color32::WHITE;
-    visuals.text_edit_bg_color = Some(egui::Color32::WHITE);
-    visuals.faint_bg_color = egui::Color32::from_rgb(247, 249, 251);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(246, 249, 250);
+    visuals.text_edit_bg_color = Some(egui::Color32::from_rgb(253, 254, 254));
+    visuals.faint_bg_color = egui::Color32::from_rgb(235, 240, 243);
+    visuals.weak_text_alpha = 0.82;
     visuals.selection.bg_fill = accent_color();
     visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
     visuals.hyperlink_color = accent_color();
@@ -2233,9 +2786,10 @@ fn configure_ui_style(context: &egui::Context) {
     visuals.error_fg_color = error_color();
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_color());
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, border_color());
-    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(243, 246, 249);
-    visuals.widgets.inactive.bg_fill = egui::Color32::WHITE;
+    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(236, 242, 244);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(253, 254, 254);
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border_color());
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.15_f32, text_color());
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
     visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(229, 241, 240);
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(247, 252, 251);
@@ -2252,11 +2806,11 @@ fn configure_ui_style(context: &egui::Context) {
 }
 
 fn app_background_color() -> egui::Color32 {
-    egui::Color32::from_rgb(244, 247, 249)
+    egui::Color32::from_rgb(237, 242, 245)
 }
 
 fn surface_color() -> egui::Color32 {
-    egui::Color32::WHITE
+    egui::Color32::from_rgb(250, 252, 252)
 }
 
 fn sidebar_color() -> egui::Color32 {
@@ -2268,7 +2822,7 @@ fn sidebar_text_color() -> egui::Color32 {
 }
 
 fn sidebar_muted_color() -> egui::Color32 {
-    egui::Color32::from_rgb(148, 163, 184)
+    egui::Color32::from_rgb(190, 203, 217)
 }
 
 fn accent_color() -> egui::Color32 {
@@ -2280,15 +2834,15 @@ fn accent_soft_color() -> egui::Color32 {
 }
 
 fn text_color() -> egui::Color32 {
-    egui::Color32::from_rgb(30, 41, 59)
+    egui::Color32::from_rgb(23, 34, 48)
 }
 
 fn muted_text_color() -> egui::Color32 {
-    egui::Color32::from_rgb(100, 116, 139)
+    egui::Color32::from_rgb(66, 82, 101)
 }
 
 fn border_color() -> egui::Color32 {
-    egui::Color32::from_rgb(220, 227, 234)
+    egui::Color32::from_rgb(194, 207, 218)
 }
 
 fn success_color() -> egui::Color32 {
@@ -2319,13 +2873,13 @@ fn brand_header(ui: &mut egui::Ui, language: GuidanceLanguage) {
         ui.vertical(|ui| {
             ui.label(
                 egui::RichText::new("BIP39 Tool")
-                    .size(18.0)
+                    .size(20.0)
                     .strong()
                     .color(sidebar_text_color()),
             );
             ui.label(
                 egui::RichText::new(language.text("Encrypted recovery"))
-                    .size(11.0)
+                    .size(13.0)
                     .color(sidebar_muted_color()),
             );
         });
@@ -2422,7 +2976,7 @@ fn navigation_button(
     language: GuidanceLanguage,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 64.0), egui::Sense::click());
     let fill = if selected {
         egui::Color32::from_rgb(31, 55, 68)
     } else if response.hovered() {
@@ -2450,10 +3004,10 @@ fn navigation_button(
     };
     paint_icon(ui.painter(), tab.icon(), icon_rect, foreground);
     ui.painter().text(
-        egui::pos2(rect.left() + 46.0, rect.center().y - 8.0),
+        egui::pos2(rect.left() + 46.0, rect.center().y - 9.0),
         egui::Align2::LEFT_CENTER,
         tab.nav_label(language),
-        egui::FontId::proportional(14.0),
+        egui::FontId::proportional(16.0),
         if selected {
             sidebar_text_color()
         } else {
@@ -2461,10 +3015,10 @@ fn navigation_button(
         },
     );
     ui.painter().text(
-        egui::pos2(rect.left() + 46.0, rect.center().y + 10.0),
+        egui::pos2(rect.left() + 46.0, rect.center().y + 11.0),
         egui::Align2::LEFT_CENTER,
         tab.nav_hint(language),
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(13.0),
         sidebar_muted_color(),
     );
     response.widget_info(|| {
@@ -2475,7 +3029,7 @@ fn navigation_button(
 
 fn sidebar_utility_button(ui: &mut egui::Ui, icon: UiIcon, label: &str) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 42.0), egui::Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, 8.0, egui::Color32::from_rgb(43, 37, 48));
@@ -2490,16 +3044,16 @@ fn sidebar_utility_button(ui: &mut egui::Ui, icon: UiIcon, label: &str) -> egui:
         egui::pos2(rect.left() + 36.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(12.0),
+        egui::FontId::proportional(14.0),
         color,
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn sidebar_status_row(ui: &mut egui::Ui, icon: UiIcon, label: &str) {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+fn sidebar_status_row(ui: &mut egui::Ui, icon: UiIcon, label: &str) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::hover());
     let icon_rect = egui::Rect::from_center_size(
         egui::pos2(rect.left() + 18.0, rect.center().y),
         egui::vec2(16.0, 16.0),
@@ -2509,9 +3063,71 @@ fn sidebar_status_row(ui: &mut egui::Ui, icon: UiIcon, label: &str) {
         egui::pos2(rect.left() + 36.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(13.0),
         sidebar_muted_color(),
     );
+    response
+}
+
+fn localized_age_update_status(language: GuidanceLanguage) -> (String, bool, Option<String>) {
+    let status = AGE_UPDATE_STATUS
+        .get()
+        .map(|status| {
+            status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        })
+        .unwrap_or(AgeUpdateStatus::Checking);
+    let label = match (&status, language) {
+        (AgeUpdateStatus::Checking, GuidanceLanguage::English) => {
+            "Checking age security…".to_string()
+        }
+        (AgeUpdateStatus::Checking, GuidanceLanguage::SimplifiedChinese) => {
+            "正在检查 age 安全更新…".to_string()
+        }
+        (AgeUpdateStatus::Checking, GuidanceLanguage::Japanese) => {
+            "age の安全な更新を確認中…".to_string()
+        }
+        (AgeUpdateStatus::Checking, GuidanceLanguage::Korean) => {
+            "age 보안 업데이트 확인 중…".to_string()
+        }
+        (AgeUpdateStatus::Bundled, GuidanceLanguage::English) => "Bundled age verified".to_string(),
+        (AgeUpdateStatus::Bundled, GuidanceLanguage::SimplifiedChinese) => {
+            "内置 age 已验证".to_string()
+        }
+        (AgeUpdateStatus::Bundled, GuidanceLanguage::Japanese) => "同梱 age を検証済み".to_string(),
+        (AgeUpdateStatus::Bundled, GuidanceLanguage::Korean) => "내장 age 검증 완료".to_string(),
+        (AgeUpdateStatus::Updated(version), GuidanceLanguage::English) => {
+            format!("age {version} verified")
+        }
+        (AgeUpdateStatus::Updated(version), GuidanceLanguage::SimplifiedChinese) => {
+            format!("age {version} 已验证")
+        }
+        (AgeUpdateStatus::Updated(version), GuidanceLanguage::Japanese) => {
+            format!("age {version} を検証済み")
+        }
+        (AgeUpdateStatus::Updated(version), GuidanceLanguage::Korean) => {
+            format!("age {version} 검증 완료")
+        }
+        (AgeUpdateStatus::Failed(_), GuidanceLanguage::English) => {
+            "age update failed; using bundled".to_string()
+        }
+        (AgeUpdateStatus::Failed(_), GuidanceLanguage::SimplifiedChinese) => {
+            "age 更新失败；正在使用内置版本".to_string()
+        }
+        (AgeUpdateStatus::Failed(_), GuidanceLanguage::Japanese) => {
+            "age 更新失敗：同梱版を使用".to_string()
+        }
+        (AgeUpdateStatus::Failed(_), GuidanceLanguage::Korean) => {
+            "age 업데이트 실패: 내장 버전 사용".to_string()
+        }
+    };
+    let error = match &status {
+        AgeUpdateStatus::Failed(error) => Some(error.clone()),
+        _ => None,
+    };
+    (label, matches!(status, AgeUpdateStatus::Checking), error)
 }
 
 fn page_header(
@@ -2525,13 +3141,13 @@ fn page_header(
         ui.vertical(|ui| {
             ui.label(
                 egui::RichText::new(tab.title(*guidance_language))
-                    .size(27.0)
+                    .size(30.0)
                     .strong()
                     .color(text_color()),
             );
             ui.label(
                 egui::RichText::new(tab.subtitle(*guidance_language))
-                    .size(13.0)
+                    .size(15.0)
                     .color(muted_text_color()),
             );
         });
@@ -2616,7 +3232,7 @@ fn paint_more_below_hint<R>(
         egui::pos2(hint_rect.center().x - 8.0, hint_rect.center().y),
         egui::Align2::CENTER_CENTER,
         language.scroll_hint(),
-        egui::FontId::proportional(12.0),
+        egui::FontId::proportional(14.0),
         egui::Color32::WHITE,
     );
     let arrow_x = hint_rect.right() - 24.0;
@@ -2656,7 +3272,7 @@ fn section_card(
         .fill(surface_color())
         .stroke(egui::Stroke::new(1.0_f32, border_color()))
         .corner_radius(12.0)
-        .inner_margin(egui::Margin::same(18))
+        .inner_margin(egui::Margin::same(20))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -2668,13 +3284,13 @@ fn section_card(
                 ui.vertical(|ui| {
                     ui.label(
                         egui::RichText::new(title)
-                            .size(16.0)
+                            .size(18.0)
                             .strong()
                             .color(text_color()),
                     );
                     ui.label(
                         egui::RichText::new(subtitle)
-                            .size(12.0)
+                            .size(14.0)
                             .color(muted_text_color()),
                     );
                 });
@@ -2685,8 +3301,8 @@ fn section_card(
 }
 
 fn action_button(ui: &mut egui::Ui, icon: UiIcon, label: &str, primary: bool) -> egui::Response {
-    let width = (label.chars().count() as f32 * 7.4 + 48.0).clamp(132.0, 224.0);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 38.0), egui::Sense::click());
+    let width = (label.chars().count() as f32 * 8.2 + 50.0).clamp(140.0, 244.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 42.0), egui::Sense::click());
     let (fill, stroke, foreground) = if primary {
         let fill = if response.is_pointer_button_down_on() {
             egui::Color32::from_rgb(10, 91, 86)
@@ -2702,11 +3318,7 @@ fn action_button(ui: &mut egui::Ui, icon: UiIcon, label: &str, primary: bool) ->
         } else {
             egui::Color32::WHITE
         };
-        (
-            fill,
-            egui::Stroke::new(1.0_f32, border_color()),
-            accent_color(),
-        )
+        (fill, egui::Stroke::new(1.0_f32, border_color()), accent_color())
     };
     ui.painter()
         .rect(rect, 8.0, fill, stroke, egui::StrokeKind::Inside);
@@ -2719,7 +3331,7 @@ fn action_button(ui: &mut egui::Ui, icon: UiIcon, label: &str, primary: bool) ->
         egui::pos2(rect.left() + 38.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(13.0),
+        egui::FontId::proportional(15.0),
         foreground,
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
@@ -2728,14 +3340,14 @@ fn action_button(ui: &mut egui::Ui, icon: UiIcon, label: &str, primary: bool) ->
 
 fn metadata_chip(ui: &mut egui::Ui, text: &str) {
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(241, 245, 249))
+        .fill(egui::Color32::from_rgb(234, 240, 243))
         .stroke(egui::Stroke::new(1.0_f32, border_color()))
         .corner_radius(12.0)
         .inner_margin(egui::Margin::symmetric(9, 5))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(text)
-                    .size(11.0)
+                    .size(13.0)
                     .color(muted_text_color()),
             );
         });
@@ -2751,7 +3363,7 @@ fn success_chip(ui: &mut egui::Ui, text: &str) {
         .corner_radius(12.0)
         .inner_margin(egui::Margin::symmetric(9, 5))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).size(11.0).color(success_color()));
+            ui.label(egui::RichText::new(text).size(13.0).color(success_color()));
         });
 }
 
@@ -3099,7 +3711,72 @@ fn localized_hidden_count(language: GuidanceLanguage, count: usize, fields: bool
 }
 
 fn localized_error(language: GuidanceLanguage, detail: &str) -> String {
-    format!("{}: {detail}", language.text("Error"))
+    if language == GuidanceLanguage::English {
+        return format!("Error: {detail}");
+    }
+    let summary = if detail.contains("passphrase and confirmation do not match") {
+        match language {
+            GuidanceLanguage::SimplifiedChinese => "两次输入的 BIP-39 附加密码不一致。",
+            GuidanceLanguage::Japanese => "BIP-39 パスフレーズが確認入力と一致しません。",
+            GuidanceLanguage::Korean => "BIP-39 패스프레이즈와 확인 입력이 일치하지 않습니다.",
+            GuidanceLanguage::English => unreachable!(),
+        }
+    } else if detail.contains("Seed phrase is invalid")
+        || detail.contains("mnemonic") && detail.contains("checksum")
+    {
+        match language {
+            GuidanceLanguage::SimplifiedChinese => "助记词不属于所选词库，或校验和不正确。",
+            GuidanceLanguage::Japanese => {
+                "ニーモニックが選択した単語リストと一致しないか、チェックサムが正しくありません。"
+            }
+            GuidanceLanguage::Korean => {
+                "니모닉이 선택한 단어 목록과 일치하지 않거나 체크섬이 올바르지 않습니다."
+            }
+            GuidanceLanguage::English => unreachable!(),
+        }
+    } else if detail.contains("Recipient") || detail.contains("recipient") {
+        match language {
+            GuidanceLanguage::SimplifiedChinese => "age 接收公钥无效或无法读取。",
+            GuidanceLanguage::Japanese => "age の受信者公開鍵が無効か、読み込めません。",
+            GuidanceLanguage::Korean => "age 수신자 공개 키가 올바르지 않거나 읽을 수 없습니다.",
+            GuidanceLanguage::English => unreachable!(),
+        }
+    } else if detail.contains("Identity") || detail.contains("identity") {
+        match language {
+            GuidanceLanguage::SimplifiedChinese => "age 私钥无效、缺失或与该备份不匹配。",
+            GuidanceLanguage::Japanese => {
+                "age 秘密鍵が無効、未指定、またはバックアップと一致しません。"
+            }
+            GuidanceLanguage::Korean => {
+                "age 개인 키가 올바르지 않거나 없거나 백업과 일치하지 않습니다."
+            }
+            GuidanceLanguage::English => unreachable!(),
+        }
+    } else if detail.contains("age") {
+        match language {
+            GuidanceLanguage::SimplifiedChinese => "age 加密组件无法完成操作。",
+            GuidanceLanguage::Japanese => "age 暗号化コンポーネントが処理を完了できませんでした。",
+            GuidanceLanguage::Korean => "age 암호화 구성 요소가 작업을 완료하지 못했습니다.",
+            GuidanceLanguage::English => unreachable!(),
+        }
+    } else {
+        match language {
+            GuidanceLanguage::SimplifiedChinese => "操作未完成。",
+            GuidanceLanguage::Japanese => "処理を完了できませんでした。",
+            GuidanceLanguage::Korean => "작업을 완료하지 못했습니다.",
+            GuidanceLanguage::English => unreachable!(),
+        }
+    };
+    let technical_label = match language {
+        GuidanceLanguage::SimplifiedChinese => "技术详情",
+        GuidanceLanguage::Japanese => "技術情報",
+        GuidanceLanguage::Korean => "기술 세부 정보",
+        GuidanceLanguage::English => unreachable!(),
+    };
+    format!(
+        "{}：{summary}\n{technical_label}: {detail}",
+        language.text("Error")
+    )
 }
 
 fn localized_saved_status(language: GuidanceLanguage, sskr: bool, path: &Path) -> String {
@@ -3130,6 +3807,34 @@ fn localized_saved_status(language: GuidanceLanguage, sskr: bool, path: &Path) -
     }
 }
 
+fn localized_sskr_export_status(language: GuidanceLanguage, path: &Path) -> String {
+    let path = path.display();
+    match language {
+        GuidanceLanguage::English => format!(" Separate share files were exported to {path}."),
+        GuidanceLanguage::SimplifiedChinese => format!(" 独立份额文件已导出到 {path}。"),
+        GuidanceLanguage::Japanese => format!(" 個別のシェアファイルを {path} に書き出しました。"),
+        GuidanceLanguage::Korean => format!(" 개별 조각 파일을 {path}에 내보냈습니다."),
+    }
+}
+
+fn localized_identity_saved_status(language: GuidanceLanguage, path: &Path) -> String {
+    let path = path.display();
+    match language {
+        GuidanceLanguage::English => {
+            format!("Created a private age identity at {path}; its public recipient is ready.")
+        }
+        GuidanceLanguage::SimplifiedChinese => {
+            format!("age 私钥已创建于 {path}；对应接收公钥已自动填入。")
+        }
+        GuidanceLanguage::Japanese => {
+            format!("age 秘密鍵を {path} に作成し、対応する受信者公開鍵を入力しました。")
+        }
+        GuidanceLanguage::Korean => {
+            format!("age 개인 키를 {path}에 만들고 해당 수신자 공개 키를 입력했습니다.")
+        }
+    }
+}
+
 fn localized_max_address_status(language: GuidanceLanguage, count: u32) -> String {
     match language {
         GuidanceLanguage::English => format!("Derive at most {count} addresses at once."),
@@ -3152,10 +3857,10 @@ fn tips_panel(ui: &mut egui::Ui, tab: Tab, language: GuidanceLanguage) {
     let (title, body) = language.tip(tab);
 
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(238, 247, 246))
+        .fill(egui::Color32::from_rgb(226, 241, 239))
         .stroke(egui::Stroke::new(
             1.0_f32,
-            egui::Color32::from_rgb(186, 224, 220),
+            egui::Color32::from_rgb(151, 205, 199),
         ))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::symmetric(14, 12))
@@ -3166,13 +3871,13 @@ fn tips_panel(ui: &mut egui::Ui, tab: Tab, language: GuidanceLanguage) {
                 ui.vertical(|ui| {
                     ui.label(
                         egui::RichText::new(title)
-                            .size(13.0)
+                            .size(15.0)
                             .strong()
                             .color(text_color()),
                     );
                     ui.label(
                         egui::RichText::new(body)
-                            .size(12.0)
+                            .size(14.0)
                             .color(muted_text_color()),
                     );
                 });
@@ -3185,7 +3890,7 @@ fn form_label(ui: &mut egui::Ui, label: &str) {
         [FORM_LABEL_WIDTH, FIELD_HEIGHT],
         egui::Label::new(
             egui::RichText::new(label)
-                .size(12.0)
+                .size(14.0)
                 .color(muted_text_color()),
         )
         .halign(egui::Align::RIGHT),
@@ -3195,7 +3900,7 @@ fn form_label(ui: &mut egui::Ui, label: &str) {
 fn stacked_form_label(ui: &mut egui::Ui, label: &str) {
     ui.label(
         egui::RichText::new(label)
-            .size(12.0)
+            .size(14.0)
             .color(muted_text_color()),
     );
 }
@@ -3253,7 +3958,13 @@ fn text_field_row(
     clicked
 }
 
-fn multiline_text_row(ui: &mut egui::Ui, label: &str, value: &mut String, rows: usize) {
+fn multiline_text_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    rows: usize,
+    password: bool,
+) {
     if ui.available_width() < 620.0 {
         stacked_form_label(ui, label);
         let field_width = ui.available_width().max(180.0);
@@ -3261,6 +3972,7 @@ fn multiline_text_row(ui: &mut egui::Ui, label: &str, value: &mut String, rows: 
         ui.add_sized(
             [field_width, row_height * rows as f32],
             egui::TextEdit::multiline(value)
+                .password(password)
                 .desired_rows(rows)
                 .lock_focus(true)
                 .desired_width(field_width),
@@ -3275,6 +3987,7 @@ fn multiline_text_row(ui: &mut egui::Ui, label: &str, value: &mut String, rows: 
         ui.add_sized(
             [field_width, row_height * rows as f32],
             egui::TextEdit::multiline(value)
+                .password(password)
                 .desired_rows(rows)
                 .lock_focus(true)
                 .desired_width(field_width),
@@ -3297,6 +4010,12 @@ fn choose_existing_file(
     }
 }
 
+fn choose_existing_folder(title: &str, target: &mut String) {
+    if let Some(path) = FileDialog::new().set_title(title).pick_folder() {
+        *target = path_to_string(path);
+    }
+}
+
 fn choose_save_file(target: &mut String, language: GuidanceLanguage) {
     let mut dialog = FileDialog::new()
         .set_title(language.text("Save encrypted backup"))
@@ -3309,6 +4028,21 @@ fn choose_save_file(target: &mut String, language: GuidanceLanguage) {
         dialog = dialog.set_directory(parent);
     }
 
+    if let Some(path) = dialog.save_file() {
+        *target = path_to_string(path);
+    }
+}
+
+fn choose_identity_save_file(target: &mut String, language: GuidanceLanguage) {
+    let mut dialog = FileDialog::new()
+        .set_title(language.text("Save private age identity"))
+        .set_file_name("age-identity.txt")
+        .add_filter(language.text("Identity file"), &["txt", "key"]);
+    let current_path = backup_save_path_from_input(target);
+    let parent = save_parent_dir(&current_path);
+    if parent.exists() {
+        dialog = dialog.set_directory(parent);
+    }
     if let Some(path) = dialog.save_file() {
         *target = path_to_string(path);
     }
@@ -3327,6 +4061,52 @@ fn current_unix_timestamp() -> Option<u64> {
 
 fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn validate_backup_envelope(value: &serde_json::Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "The decrypted backup must be a JSON object.".to_string())?;
+    let schema_version = object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "The decrypted backup has no valid schema version.".to_string())?;
+    if schema_version == 0 || schema_version > u64::from(BACKUP_SCHEMA_VERSION) {
+        return Err(format!(
+            "Unsupported backup schema version {schema_version}; this app supports versions 1 through {BACKUP_SCHEMA_VERSION}."
+        ));
+    }
+    let backup_type = object
+        .get("backup_type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "The decrypted backup has no backup type.".to_string())?;
+    if !matches!(backup_type, "mnemonic" | "sskr") {
+        return Err(format!("Unsupported backup type: {backup_type}"));
+    }
+    if object
+        .get("passphrase")
+        .is_some_and(|value| !value.is_string() && !value.is_null())
+    {
+        return Err("The decrypted backup passphrase field is malformed.".to_string());
+    }
+    match backup_type {
+        "mnemonic"
+            if !object
+                .get("seed_phrase")
+                .is_some_and(serde_json::Value::is_string) =>
+        {
+            Err("A mnemonic backup must contain a seed phrase string.".to_string())
+        }
+        "sskr"
+            if !object
+                .get("sskr")
+                .and_then(|value| value.get("groups"))
+                .is_some_and(serde_json::Value::is_array) =>
+        {
+            Err("An SSKR backup must contain recovery groups.".to_string())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn render_backup_view(
@@ -3711,7 +4491,7 @@ fn section_header(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
     ui.colored_label(
         section_color(),
-        egui::RichText::new(title).strong().size(16.0),
+        egui::RichText::new(title).strong().size(18.0),
     );
 }
 
@@ -3981,6 +4761,104 @@ fn sskr_backup_from_entropy(
     Ok((GuiSskrBackup { groups }, sskr_rule_label(settings)))
 }
 
+fn prepare_sskr_export_plan(backup: &GuiBackup, parent: PathBuf) -> Result<SskrExportPlan, String> {
+    if let Some(symlink) = first_symlink_ancestor(&parent) {
+        return Err(format!(
+            "The SSKR export folder has a symlinked ancestor: {}",
+            symlink.display()
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&parent).map_err(|error| {
+        format!(
+            "Could not open the SSKR export folder {}: {error}",
+            parent.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "The SSKR export location must be an existing, non-symlink folder: {}",
+            parent.display()
+        ));
+    }
+    let mut files = Vec::new();
+    for (group_index, group) in backup.sskr.groups.iter().enumerate() {
+        for (share_index, share) in group.iter().enumerate() {
+            files.push((
+                format!(
+                    "group-{:02}-share-{:02}.txt",
+                    group_index + 1,
+                    share_index + 1
+                ),
+                Zeroizing::new(format!("{}\n", share.mnemonic)),
+            ));
+        }
+    }
+    if files.is_empty() {
+        return Err("There are no SSKR shares to export.".to_string());
+    }
+    let timestamp = backup.created_at_unix.unwrap_or_default();
+    Ok(SskrExportPlan {
+        parent,
+        directory_name: format!("BIP39-SSKR-{timestamp}-"),
+        files,
+        recovery_rule: backup.recovery_info.clone(),
+        mnemonic_language: backup.language.clone(),
+    })
+}
+
+fn export_sskr_shares_atomic(plan: SskrExportPlan) -> Result<PathBuf, String> {
+    let directory = tempfile::Builder::new()
+        .prefix(".bip39-sskr-staging-")
+        .tempdir_in(&plan.parent)
+        .map_err(|error| format!("Could not create the separate SSKR share set: {error}"))?;
+    let readme = format!(
+        "BIP39 Tool — separate SSKR recovery shares\n\nMnemonic language: {}\n{}\n\nEach share file contains exactly one recovery share. Store the files in separate trusted locations; do not keep the complete set together.\n",
+        plan.mnemonic_language,
+        plan.recovery_rule,
+    );
+    write_private_file(&directory.path().join("README.txt"), readme.as_bytes())?;
+    for (name, contents) in plan.files {
+        write_private_file(&directory.path().join(name), contents.as_bytes())?;
+    }
+    sync_parent_directory(directory.path())?;
+    let suffix = directory
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(".bip39-sskr-staging-"))
+        .ok_or_else(|| "Could not determine the SSKR share-set name.".to_string())?;
+    let path = plan
+        .parent
+        .join(format!("{}{}", plan.directory_name, suffix));
+    if std::fs::symlink_metadata(&path).is_ok() {
+        return Err(format!(
+            "Refusing to replace an existing SSKR share set: {}",
+            path.display()
+        ));
+    }
+    std::fs::rename(directory.path(), &path)
+        .map_err(|error| format!("Could not activate the SSKR share set: {error}"))?;
+    std::mem::forget(directory);
+    sync_parent_directory(&plan.parent)?;
+    Ok(path)
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("Could not create {}: {error}", path.display()))?;
+    file.write_all(contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("Could not finish writing {}: {error}", path.display()))
+}
+
 fn shares_from_text(
     input: &str,
     language: MnemonicLanguage,
@@ -4164,7 +5042,9 @@ fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
 }
 
 fn mnemonic_to_share(mnemonic: &str, language: Language) -> Option<Vec<u8>> {
-    let words: Vec<&str> = mnemonic.split_whitespace().collect();
+    let mut normalized = Cow::Borrowed(mnemonic);
+    Mnemonic::normalize_utf8_cow(&mut normalized);
+    let words: Vec<&str> = normalized.split_whitespace().collect();
     let wordlist = language.word_list();
     let mut bits = Zeroizing::new(Vec::new());
     for word in words {
@@ -4230,10 +5110,28 @@ fn is_sensitive_json_key(key: &str) -> bool {
             | "xprv"
     ) || normalized.contains("secret")
         || normalized.contains("private")
+        || !matches!(
+            normalized.as_str(),
+            "language"
+                | "sskr"
+                | "groups"
+                | "recovery_info"
+                | "schema_version"
+                | "backup_type"
+                | "created_at_unix"
+                | "tool_version"
+        )
 }
 
-fn status_is_error(status: &str) -> bool {
-    status.contains("failed")
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusSeverity {
+    Success,
+    Warning,
+    Error,
+}
+
+fn status_severity(status: &str) -> StatusSeverity {
+    if status.contains("failed")
         || status.contains("Failed")
         || status.contains("Error")
         || status.contains("must")
@@ -4247,6 +5145,25 @@ fn status_is_error(status: &str) -> bool {
         || status.contains("失敗")
         || status.contains("오류")
         || status.contains("실패")
+    {
+        StatusSeverity::Error
+    } else if status.contains("does not contain")
+        || status.contains("missing")
+        || status.contains("No passphrase")
+        || status.contains("没有")
+        || status.contains("未找到")
+        || status.contains("未保存")
+        || status.contains("含まれていません")
+        || status.contains("なし")
+        || status.contains("保存されていません")
+        || status.contains("없습니다")
+        || status.contains("없음")
+        || status.contains("저장되어 있지 않습니다")
+    {
+        StatusSeverity::Warning
+    } else {
+        StatusSeverity::Success
+    }
 }
 
 fn status_banner(ui: &mut egui::Ui, status: &str) {
@@ -4254,19 +5171,23 @@ fn status_banner(ui: &mut egui::Ui, status: &str) {
         return;
     }
     ui.add_space(10.0);
-    let is_error = status_is_error(status);
-    let (foreground, background, border) = if is_error {
-        (
+    let severity = status_severity(status);
+    let (foreground, background, border) = match severity {
+        StatusSeverity::Error => (
             error_color(),
             egui::Color32::from_rgb(254, 242, 242),
             egui::Color32::from_rgb(254, 202, 202),
-        )
-    } else {
-        (
+        ),
+        StatusSeverity::Warning => (
+            warning_color(),
+            egui::Color32::from_rgb(255, 251, 235),
+            egui::Color32::from_rgb(253, 230, 138),
+        ),
+        StatusSeverity::Success => (
             success_color(),
             egui::Color32::from_rgb(240, 253, 244),
             egui::Color32::from_rgb(187, 247, 208),
-        )
+        ),
     };
     egui::Frame::new()
         .fill(background)
@@ -4277,7 +5198,7 @@ fn status_banner(ui: &mut egui::Ui, status: &str) {
             ui.horizontal_wrapped(|ui| {
                 paint_icon_widget(
                     ui,
-                    if is_error {
+                    if severity != StatusSeverity::Success {
                         UiIcon::Info
                     } else {
                         UiIcon::Shield
@@ -4285,13 +5206,13 @@ fn status_banner(ui: &mut egui::Ui, status: &str) {
                     16.0,
                     foreground,
                 );
-                ui.label(egui::RichText::new(status).size(12.0).color(foreground));
+                ui.label(egui::RichText::new(status).size(14.0).color(foreground));
             });
         });
 }
 
 fn parse_backup_mnemonic(language: MnemonicLanguage, phrase: &str) -> Result<Mnemonic, String> {
-    Mnemonic::parse_in_normalized(language.bip39(), phrase.trim())
+    Mnemonic::parse_in(language.bip39(), phrase.trim())
         .map_err(|err| format!("Seed phrase is invalid for {}: {err}", language.label()))
 }
 
@@ -4369,15 +5290,37 @@ fn validate_save_path(path: &Path) -> Result<(), String> {
             parent.display()
         ));
     }
-    if let Ok(parent_metadata) = std::fs::symlink_metadata(parent) {
-        if parent_metadata.file_type().is_symlink() {
-            return Err(format!(
-                "Parent directory is a symlink: {}",
-                parent.display()
-            ));
-        }
+    if let Some(symlink) = first_symlink_ancestor(parent) {
+        return Err(format!(
+            "Parent directory is a symlink (directly or through an ancestor): {}",
+            symlink.display()
+        ));
     }
     Ok(())
+}
+
+fn first_symlink_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if std::fs::symlink_metadata(&current)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+        {
+            // macOS exposes a few protected system directories through stable
+            // root-level compatibility symlinks (for example /var ->
+            // /private/var). Treating those as user-controlled path traversal
+            // would reject normal file-picker and tempfile locations. Any
+            // symlink below these platform aliases is still rejected.
+            #[cfg(target_os = "macos")]
+            if matches!(current.as_path(), p if p == Path::new("/var") || p == Path::new("/tmp") || p == Path::new("/etc"))
+            {
+                continue;
+            }
+            return Some(current);
+        }
+    }
+    None
 }
 
 fn is_supported_age_recipient(line: &str) -> bool {
@@ -4412,9 +5355,14 @@ fn push_unique_recipient(recipients: &mut Vec<String>, recipient: String) {
 }
 
 fn read_age_recipients_from_file(path: &str) -> Result<Vec<String>, String> {
+    let bytes = read_file_limited(
+        Path::new(path),
+        MAX_RECIPIENT_FILE_BYTES,
+        "age recipient file",
+    )?;
     let contents = Zeroizing::new(
-        std::fs::read_to_string(path)
-            .map_err(|err| format!("Failed to read recipient file '{path}': {err}"))?,
+        String::from_utf8(bytes)
+            .map_err(|error| format!("Recipient file '{path}' is not valid UTF-8: {error}"))?,
     );
     let mut recipients = Vec::new();
     for raw_line in contents.lines() {
@@ -4536,8 +5484,21 @@ struct AgeGitHubAsset {
 }
 
 fn spawn_age_auto_update() {
+    let _ = AGE_UPDATE_STATUS.set(Mutex::new(AgeUpdateStatus::Checking));
     std::thread::spawn(|| {
-        let _ = update_age_component();
+        let result = update_age_component();
+        if let Some(status) = AGE_UPDATE_STATUS.get() {
+            *status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = match result {
+                Ok(Some(version)) => AgeUpdateStatus::Updated(version),
+                Ok(None) => AgeUpdateStatus::Bundled,
+                Err(error) => {
+                    eprintln!("age automatic update failed: {error}");
+                    AgeUpdateStatus::Failed(error)
+                }
+            };
+        }
     });
 }
 
@@ -4585,44 +5546,33 @@ fn age_cache_root() -> Option<PathBuf> {
 }
 
 fn auto_updated_age_binary() -> Option<PathBuf> {
-    let root = age_cache_root()?;
-    let bundled_version = parse_age_version(BUNDLED_AGE_VERSION)?;
-    let executable_name = age_executable_name(std::env::consts::OS);
-    std::fs::read_dir(root)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let version_name = entry.file_name();
-            let version = parse_age_version(version_name.to_str()?)?;
-            let binary = entry.path().join(executable_name);
-            (version >= bundled_version && binary.is_file()).then_some((version, binary))
-        })
-        .max_by_key(|(version, _)| *version)
-        .map(|(_, binary)| binary)
+    let trusted = TRUSTED_UPDATED_AGE
+        .get()
+        .and_then(|path| path.read().ok()?.clone())?;
+    verify_binary_digest(&trusted.path, &trusted.sha256)
+        .is_ok()
+        .then_some(trusted.path)
 }
 
-fn update_age_component() -> Result<(), String> {
+fn update_age_component() -> Result<Option<String>, String> {
     let root =
         age_cache_root().ok_or_else(|| "No per-user data directory available.".to_string())?;
-    let check_marker = root.join("last-check");
-    if std::fs::metadata(&check_marker)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|elapsed| elapsed < AGE_UPDATE_INTERVAL)
-    {
-        return Ok(());
-    }
-
-    let release: AgeGitHubRelease = ureq::get(AGE_RELEASE_API)
+    let agent = update_http_agent();
+    let release_response = agent
+        .get(AGE_RELEASE_API)
         .set("Accept", "application/vnd.github+json")
         .set(
             "User-Agent",
             concat!("bip39-tool/", env!("CARGO_PKG_VERSION")),
         )
         .call()
-        .map_err(|error| format!("Could not check the latest age release: {error}"))?
-        .into_json()
+        .map_err(|error| format!("Could not check the latest age release: {error}"))?;
+    let release_bytes = read_limited(
+        release_response.into_reader(),
+        MAX_AGE_RELEASE_METADATA_BYTES,
+        "age release metadata",
+    )?;
+    let release: AgeGitHubRelease = serde_json::from_slice(&release_bytes)
         .map_err(|error| format!("Could not read the age release response: {error}"))?;
 
     let latest_version = parse_age_version(&release.tag_name)
@@ -4636,30 +5586,147 @@ fn update_age_component() -> Result<(), String> {
     let executable_name = age_executable_name(std::env::consts::OS);
     let installed_binary = version_directory.join(executable_name);
 
-    if latest_version > bundled_version && !installed_binary.is_file() {
-        let asset_name = age_release_asset_name(
-            &release.tag_name,
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-        )
-        .ok_or_else(|| "No automatic age update is available for this platform.".to_string())?;
-        let asset = release
-            .assets
-            .iter()
-            .find(|asset| asset.name == asset_name)
-            .ok_or_else(|| format!("The age release does not contain {asset_name}."))?;
-        install_age_release(asset, &version_directory, executable_name)?;
+    if latest_version <= bundled_version {
+        set_trusted_updated_age(None);
+        return Ok(None);
     }
 
-    std::fs::create_dir_all(&root)
-        .map_err(|error| format!("Could not create the age update directory: {error}"))?;
-    OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(check_marker)
-        .and_then(|mut file| file.write_all(release.tag_name.as_bytes()))
-        .map_err(|error| format!("Could not record the age update check: {error}"))?;
+    let asset_name = age_release_asset_name(
+        &release.tag_name,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+    .ok_or_else(|| "No automatic age update is available for this platform.".to_string())?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or_else(|| format!("The age release does not contain {asset_name}."))?;
+
+    if verify_cached_age_release(
+        asset,
+        &version_directory,
+        executable_name,
+        &release.tag_name,
+    )
+    .is_err()
+    {
+        install_age_release(asset, &version_directory, executable_name)?;
+    }
+    let sha256 = verify_cached_age_release(
+        asset,
+        &version_directory,
+        executable_name,
+        &release.tag_name,
+    )?;
+    set_trusted_updated_age(Some(TrustedAgeBinary {
+        path: installed_binary,
+        sha256,
+    }));
+    Ok(Some(release.tag_name))
+}
+
+fn update_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(30))
+        .build()
+}
+
+fn set_trusted_updated_age(path: Option<TrustedAgeBinary>) {
+    let trusted = TRUSTED_UPDATED_AGE.get_or_init(|| RwLock::new(None));
+    *trusted
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+fn expected_age_asset_digest(asset: &AgeGitHubAsset) -> Result<&str, String> {
+    asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| "The age release asset has no valid SHA-256 digest.".to_string())
+}
+
+fn verify_cached_age_release(
+    asset: &AgeGitHubAsset,
+    version_directory: &Path,
+    executable_name: &str,
+    expected_version: &str,
+) -> Result<[u8; 32], String> {
+    let archive_path = version_directory.join(&asset.name);
+    let binary_path = version_directory.join(executable_name);
+    for path in [&archive_path, &binary_path] {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "Refusing an untrusted age cache entry: {}",
+                path.display()
+            ));
+        }
+    }
+
+    let archive = read_file_limited(&archive_path, MAX_AGE_ARCHIVE_BYTES, "cached age archive")?;
+    let actual_digest = hex::encode(Sha256::digest(&archive));
+    if !actual_digest.eq_ignore_ascii_case(expected_age_asset_digest(asset)?) {
+        return Err("The cached age archive failed SHA-256 verification.".to_string());
+    }
+    let (expected_executable, _) = if asset.name.ends_with(".zip") {
+        read_age_zip(&archive, executable_name)?
+    } else {
+        read_age_tar_gz(&archive, executable_name)?
+    };
+    let installed = read_file_limited(
+        &binary_path,
+        MAX_AGE_EXECUTABLE_BYTES,
+        "cached age executable",
+    )?;
+    let installed_digest: [u8; 32] = Sha256::digest(&installed).into();
+    let expected_executable_digest: [u8; 32] = Sha256::digest(&expected_executable).into();
+    if installed_digest != expected_executable_digest {
+        return Err(
+            "The cached age executable does not match the authenticated archive.".to_string(),
+        );
+    }
+    let mut command = Command::new(&binary_path);
+    command.arg("--version");
+    let output = run_age_process(
+        command,
+        Zeroizing::new(Vec::new()),
+        MAX_AGE_DIAGNOSTIC_BYTES,
+    )?;
+    let version = String::from_utf8_lossy(&output);
+    if !version.trim().contains(expected_version) {
+        return Err("The cached age executable reports an unexpected version.".to_string());
+    }
+    Ok(installed_digest)
+}
+
+fn verify_binary_digest(path: &Path, expected: &[u8; 32]) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "Refusing an untrusted executable path: {}",
+            path.display()
+        ));
+    }
+    let executable = read_file_limited(path, MAX_AGE_EXECUTABLE_BYTES, "age executable")?;
+    let actual: [u8; 32] = Sha256::digest(&executable).into();
+    if &actual != expected {
+        return Err(format!(
+            "Executable integrity check failed: {}",
+            path.display()
+        ));
+    }
     Ok(())
 }
 
@@ -4671,14 +5738,10 @@ fn install_age_release(
     if !asset.browser_download_url.starts_with(AGE_DOWNLOAD_PREFIX) {
         return Err("The age release asset does not use the official download host.".to_string());
     }
-    let expected_digest = asset
-        .digest
-        .as_deref()
-        .and_then(|digest| digest.strip_prefix("sha256:"))
-        .filter(|digest| digest.len() == 64)
-        .ok_or_else(|| "The age release asset has no SHA-256 digest.".to_string())?;
+    let expected_digest = expected_age_asset_digest(asset)?;
     let archive = read_limited(
-        ureq::get(&asset.browser_download_url)
+        update_http_agent()
+            .get(&asset.browser_download_url)
             .set(
                 "User-Agent",
                 concat!("bip39-tool/", env!("CARGO_PKG_VERSION")),
@@ -4701,6 +5764,7 @@ fn install_age_release(
     };
     std::fs::create_dir_all(version_directory)
         .map_err(|error| format!("Could not create the age version directory: {error}"))?;
+    write_age_update_file(&version_directory.join(&asset.name), &archive)?;
     write_age_update_file(&version_directory.join("LICENSE"), &license)?;
 
     let executable_suffix = if executable_name.ends_with(".exe") {
@@ -4728,15 +5792,27 @@ fn install_age_release(
     }
     let temporary_binary = temporary_file.path().to_path_buf();
     let final_binary = version_directory.join(executable_name);
-    let validation = Command::new(&temporary_binary).arg("--version").output();
-    if !validation.is_ok_and(|output| output.status.success()) {
-        return Err("The downloaded age executable did not pass its launch check.".to_string());
+    let mut command = Command::new(&temporary_binary);
+    command.arg("--version");
+    run_age_process(
+        command,
+        Zeroizing::new(Vec::new()),
+        MAX_AGE_DIAGNOSTIC_BYTES,
+    )
+    .map_err(|error| {
+        format!("The downloaded age executable did not pass its launch check: {error}")
+    })?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&final_binary) {
+        if metadata.is_file() || metadata.file_type().is_symlink() {
+            std::fs::remove_file(&final_binary)
+                .map_err(|error| format!("Could not replace the cached age executable: {error}"))?;
+        } else {
+            return Err("The cached age executable path is not a file.".to_string());
+        }
     }
-    if !final_binary.is_file() {
-        temporary_file
-            .persist_noclobber(&final_binary)
-            .map_err(|error| format!("Could not activate the age update: {}", error.error))?;
-    }
+    temporary_file
+        .persist_noclobber(&final_binary)
+        .map_err(|error| format!("Could not activate the age update: {}", error.error))?;
     Ok(())
 }
 
@@ -4750,6 +5826,12 @@ fn read_limited<R: Read>(reader: R, limit: u64, label: &str) -> Result<Vec<u8>, 
         return Err(format!("The {label} is unexpectedly large."));
     }
     Ok(bytes)
+}
+
+fn read_file_limited(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("Could not open {}: {error}", path.display()))?;
+    read_limited(file, limit, label)
 }
 
 fn read_age_tar_gz(archive: &[u8], executable_name: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
@@ -4817,16 +5899,33 @@ fn read_age_zip(archive: &[u8], executable_name: &str) -> Result<(Vec<u8>, Vec<u
 }
 
 fn write_age_update_file(path: &Path, contents: &[u8]) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
-    file.write_all(contents)
-        .and_then(|()| file.sync_all())
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("No parent directory for {}.", path.display()))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".age-component-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("Could not create an age update file: {error}"))?;
+    temporary
+        .as_file_mut()
+        .write_all(contents)
+        .and_then(|()| temporary.as_file().sync_all())
         .map_err(|error| format!("Could not finish writing {}: {error}", path.display()))?;
-    Ok(())
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.is_file() || metadata.file_type().is_symlink() {
+            std::fs::remove_file(path)
+                .map_err(|error| format!("Could not replace {}: {error}", path.display()))?;
+        } else {
+            return Err(format!(
+                "Refusing to replace non-file path {}.",
+                path.display()
+            ));
+        }
+    }
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| format!("Could not activate {}: {}", path.display(), error.error))?;
+    sync_parent_directory(parent)
 }
 
 fn resolve_age_binary(
@@ -4853,59 +5952,171 @@ fn resolve_age_binary(
     "age".into()
 }
 
-fn age_command() -> Command {
+fn age_command() -> Result<Command, String> {
     let current_executable = std::env::current_exe().ok();
+    let override_binary = std::env::var_os("BIP39_AGE_BINARY");
+    let updated_binary = auto_updated_age_binary();
     let binary = resolve_age_binary(
-        std::env::var_os("BIP39_AGE_BINARY"),
-        auto_updated_age_binary(),
+        override_binary.clone(),
+        updated_binary.clone(),
         current_executable.as_deref(),
     );
-    Command::new(binary)
+    if override_binary.is_none() && updated_binary.is_none() {
+        if let Some(adjacent) = current_executable
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|directory| directory.join(age_executable_name(std::env::consts::OS)))
+            .filter(|path| path.is_file())
+        {
+            verify_bundled_age_tool(&adjacent, false)?;
+        }
+    }
+    Ok(Command::new(binary))
 }
 
-fn encrypt_data(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>, String> {
+fn age_keygen_executable_name(os: &str) -> &'static str {
+    if os == "windows" {
+        "age-keygen.exe"
+    } else {
+        "age-keygen"
+    }
+}
+
+fn age_keygen_command() -> Result<Command, String> {
+    if let Some(binary) = std::env::var_os("BIP39_AGE_KEYGEN_BINARY") {
+        return Ok(Command::new(binary));
+    }
+    let executable_name = age_keygen_executable_name(std::env::consts::OS);
+    let adjacent = std::env::current_exe()
+        .ok()
+        .and_then(|executable| {
+            executable
+                .parent()
+                .map(|parent| parent.join(executable_name))
+        })
+        .filter(|path| path.is_file());
+    if let Some(adjacent) = adjacent {
+        verify_bundled_age_tool(&adjacent, true)?;
+        Ok(Command::new(adjacent))
+    } else {
+        Ok(Command::new(executable_name))
+    }
+}
+
+fn verify_bundled_age_tool(path: &Path, keygen: bool) -> Result<(), String> {
+    if std::env::consts::OS == "macos" {
+        let mut command = Command::new("/usr/bin/codesign");
+        command.arg("--verify").arg("--strict").arg(path);
+        run_age_process(
+            command,
+            Zeroizing::new(Vec::new()),
+            MAX_AGE_DIAGNOSTIC_BYTES,
+        )
+        .map(|_| ())
+        .map_err(|error| format!("Bundled age code-signature verification failed: {error}"))?;
+        return Ok(());
+    }
+    let expected = bundled_age_tool_sha256(std::env::consts::OS, std::env::consts::ARCH, keygen)
+        .ok_or_else(|| "No bundled age integrity value exists for this platform.".to_string())?;
+    let expected = hex::decode(expected)
+        .map_err(|error| format!("The bundled age integrity value is invalid: {error}"))?;
+    let expected: [u8; 32] = expected
+        .try_into()
+        .map_err(|_| "The bundled age integrity value has the wrong size.".to_string())?;
+    verify_binary_digest(path, &expected)
+}
+
+fn bundled_age_tool_sha256(os: &str, arch: &str, keygen: bool) -> Option<&'static str> {
+    match (os, arch, keygen) {
+        ("macos", "aarch64", false) => {
+            Some("0e3ea0b1bed2b30aa2dc46eef4e1723864d626c80f37319c20d9b73ca045f56f")
+        }
+        ("macos", "aarch64", true) => {
+            Some("37c4b509d86f233d8dd065f5a905e11d2e1d5549d59445a9bc52da9235a622ad")
+        }
+        ("macos", "x86_64", false) => {
+            Some("3c5122c6c5b63c78089ab80f97983bfea98b9afa9e87dde198a1184295defb3c")
+        }
+        ("macos", "x86_64", true) => {
+            Some("cc40c527f3d3bd15018f29d08298f72ba529770ad99449a466de7c34cc914dee")
+        }
+        ("linux", "x86_64", false) => {
+            Some("2e305637f2a0555305e21c17fb74446acbb39b53135d43d4b744e50c287133a5")
+        }
+        ("linux", "x86_64", true) => {
+            Some("c56ef69834e18ca4d3b953117f4481522c35fb6862a5d2871685aa4685893664")
+        }
+        ("linux", "aarch64", false) => {
+            Some("92da3edf27811a65a599342d743a13bb50b7f0b07f8947530d4e83249f2e4532")
+        }
+        ("linux", "aarch64", true) => {
+            Some("8d6ae68268f2ba9f469a85e460a7e9bb3218c451db050e29c294d6d1bcac2dbd")
+        }
+        ("windows", "x86_64", false) => {
+            Some("90f5cc37249c06e0b302e476a8a63bcefeecd9437c192b8af33e6ff2d69558dd")
+        }
+        ("windows", "x86_64", true) => {
+            Some("8b9c27ef2ab6f215f689bf1e609bf82c8faf4c041f32452fa80396b3f8c4f687")
+        }
+        _ => None,
+    }
+}
+
+fn generate_age_identity(path: &Path, cancellation: Option<&AtomicBool>) -> Result<String, String> {
+    let identity = Zeroizing::new(run_age_process_cancellable(
+        age_keygen_command()?,
+        Zeroizing::new(Vec::new()),
+        MAX_AGE_DIAGNOSTIC_BYTES,
+        cancellation,
+    )?);
+    if !identity.starts_with(b"# created:")
+        || !identity
+            .windows(15)
+            .any(|window| window == b"AGE-SECRET-KEY-")
+    {
+        return Err("age-keygen returned an unexpected identity format.".to_string());
+    }
+    if let Some(cancellation) = cancellation {
+        ensure_not_cancelled(cancellation)?;
+    }
+    persist_noclobber(path, identity.as_slice())?;
+    let path_text = path.to_string_lossy();
+    read_age_recipients_from_file(&path_text)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "The generated identity has no public recipient.".to_string())
+}
+
+fn encrypt_data(
+    plaintext: &[u8],
+    recipients: &[String],
+    cancellation: Option<&AtomicBool>,
+) -> Result<Vec<u8>, String> {
     if recipients.is_empty() {
         return Err("At least one recipient is required.".to_string());
     }
 
-    let mut command = age_command();
+    let mut command = age_command()?;
     for recipient in recipients {
         command.arg("-r").arg(recipient);
     }
 
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                "Failed to spawn age: binary not found in PATH.".to_string()
-            } else {
-                format!("Failed to spawn age: {err}")
-            }
-        })?;
-
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "Failed to open stdin for age.".to_string())?
-        .write_all(plaintext)
-        .map_err(|err| format!("Failed to write to age stdin: {err}"))?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("Failed to read age output: {err}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    Ok(output.stdout)
+    run_age_process_cancellable(
+        command,
+        Zeroizing::new(plaintext.to_vec()),
+        MAX_BACKUP_CIPHERTEXT_BYTES,
+        cancellation,
+    )
 }
 
-fn decrypt_data(ciphertext: &[u8], identity_input: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+fn decrypt_data(
+    ciphertext: &[u8],
+    identity_input: &str,
+    cancellation: Option<&AtomicBool>,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let identity = age_identity_from_input(identity_input)?;
     let mut _ciphertext_file = None;
-    let mut command = age_command();
+    let mut command = age_command()?;
     command.arg("-d").arg("-i");
 
     match &identity {
@@ -4925,67 +6136,171 @@ fn decrypt_data(ciphertext: &[u8], identity_input: &str) -> Result<Zeroizing<Vec
         }
     }
 
+    let input = match &identity {
+        AgeIdentityInput::File(_) => Zeroizing::new(ciphertext.to_vec()),
+        AgeIdentityInput::LiteralSecret(secret) => {
+            let mut input = Zeroizing::new(secret.as_bytes().to_vec());
+            if !input.ends_with(b"\n") {
+                input.push(b'\n');
+            }
+            input
+        }
+    };
+    run_age_process_cancellable(command, input, MAX_BACKUP_PLAINTEXT_BYTES, cancellation)
+        .map(Zeroizing::new)
+}
+
+fn run_age_process(
+    command: Command,
+    input: Zeroizing<Vec<u8>>,
+    stdout_limit: u64,
+) -> Result<Vec<u8>, String> {
+    run_age_process_cancellable(command, input, stdout_limit, None)
+}
+
+fn run_age_process_cancellable(
+    mut command: Command,
+    input: Zeroizing<Vec<u8>>,
+    stdout_limit: u64,
+    cancellation: Option<&AtomicBool>,
+) -> Result<Vec<u8>, String> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                "Failed to spawn age: binary not found in PATH.".to_string()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "Failed to spawn age: bundled binary is unavailable.".to_string()
             } else {
-                format!("Failed to spawn age: {err}")
+                format!("Failed to spawn age: {error}")
             }
         })?;
 
-    let stdin = child
+    let mut stdin = child
         .stdin
-        .as_mut()
+        .take()
         .ok_or_else(|| "Failed to open stdin for age.".to_string())?;
-    match &identity {
-        AgeIdentityInput::File(_) => {
-            stdin
-                .write_all(ciphertext)
-                .map_err(|err| format!("Failed to write to age stdin: {err}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to open stdout for age.".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to open stderr for age.".to_string())?;
+
+    let writer = std::thread::spawn(move || {
+        let input = input;
+        stdin
+            .write_all(input.as_slice())
+            .map_err(|error| format!("Failed to write to age stdin: {error}"))
+    });
+    let stdout_reader =
+        std::thread::spawn(move || read_limited(stdout, stdout_limit, "age output"));
+    let stderr_reader = std::thread::spawn(move || {
+        read_limited(stderr, MAX_AGE_DIAGNOSTIC_BYTES, "age diagnostic output")
+    });
+
+    let deadline = Instant::now() + AGE_PROCESS_TIMEOUT;
+    let status = loop {
+        if cancellation.is_some_and(|cancellation| cancellation.load(Ordering::Acquire)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = writer.join();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("Operation cancelled and sensitive worker state cleared.".to_string());
         }
-        AgeIdentityInput::LiteralSecret(secret) => {
-            stdin
-                .write_all(secret.as_bytes())
-                .map_err(|err| format!("Failed to write identity to age stdin: {err}"))?;
-            if !secret.ends_with('\n') {
-                stdin
-                    .write_all(b"\n")
-                    .map_err(|err| format!("Failed to finalize identity: {err}"))?;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = writer.join();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "age did not finish within {} seconds.",
+                    AGE_PROCESS_TIMEOUT.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = writer.join();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("Failed while waiting for age: {error}"));
             }
         }
-    }
+    };
 
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("Failed to read age output: {err}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    let write_result = writer
+        .join()
+        .map_err(|_| "The age input worker stopped unexpectedly.".to_string())?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "The age output worker stopped unexpectedly.".to_string())??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "The age diagnostic worker stopped unexpectedly.".to_string())??;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("age exited with status {status}.")
+        } else {
+            detail
+        });
     }
-    Ok(Zeroizing::new(output.stdout))
+    write_result?;
+    Ok(stdout)
+}
+
+fn ensure_not_cancelled(cancellation: &AtomicBool) -> Result<(), String> {
+    if cancellation.load(Ordering::Acquire) {
+        Err("Operation cancelled and sensitive worker state cleared.".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn persist_noclobber(path: &Path, contents: &[u8]) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-
+    let parent = save_parent_dir(path);
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".bip39-backup-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("Failed to create a temporary backup file: {error}"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("Failed to protect the temporary backup file: {error}"))?;
     }
+    temporary
+        .as_file_mut()
+        .write_all(contents)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| format!("Failed to create {}: {}", path.display(), error.error))?;
+    sync_parent_directory(parent)
+}
 
-    let mut file = options
-        .open(path)
-        .map_err(|err| format!("Failed to create {}: {err}", path.display()))?;
-
-    file.write_all(contents)
-        .and_then(|_| file.sync_all())
-        .map_err(|err| format!("Failed to write {}: {err}", path.display()))
+fn sync_parent_directory(parent: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("Failed to finish saving in {}: {error}", parent.display()))?;
+    }
+    Ok(())
 }
 
 fn derivation_path_for(kind: AddressKind, index: u32, hardened: bool) -> String {
@@ -5016,7 +6331,12 @@ fn derive_address_rows(
     end: u32,
     hardened: bool,
 ) -> Result<Vec<AddressRow>, String> {
-    let mut rows = Vec::with_capacity((end - start + 1) as usize);
+    let count = end
+        .checked_sub(start)
+        .and_then(|difference| difference.checked_add(1))
+        .filter(|count| *count <= MAX_DERIVE_COUNT)
+        .ok_or_else(|| format!("Address range must contain at most {MAX_DERIVE_COUNT} entries."))?;
+    let mut rows = Vec::with_capacity(count as usize);
 
     match kind {
         AddressKind::Bitcoin | AddressKind::Ethereum | AddressKind::Xrp => {
@@ -5296,7 +6616,10 @@ mod tests {
             "Generate seed",
             "Seed phrase",
             "Reveal generated phrase",
+            "Reveal seed phrase",
             "Passphrase",
+            "Confirm passphrase",
+            "Enter the same passphrase again",
             "Optional BIP-39 passphrase",
             "Reveal passphrase",
             "Include passphrase in encrypted backup",
@@ -5308,11 +6631,22 @@ mod tests {
             "Require",
             "Shares per group",
             "Recovery rule",
+            "Separate storage",
+            "Export each SSKR share as a separate file",
+            "Export folder",
+            "Choose folder",
+            "Choose SSKR export folder",
             "Encrypt and save",
             "Recipient",
+            "I verified that I control this recipient's private identity",
             "Choose file",
             "Backup file",
             "Save as",
+            "Need a key? Create a private age identity locally; its public recipient will be filled in automatically.",
+            "New identity file",
+            "Create age identity",
+            "Save private age identity",
+            "Identity file",
             "Unlock backup",
             "Open file",
             "Private identity",
@@ -5325,10 +6659,13 @@ mod tests {
             "Recovery shares",
             "Share language",
             "SSKR shares",
+            "Reveal recovery shares",
             "Wallet passphrase",
             "Recover seed",
             "Derivation inputs",
             "Network",
+            "Address type",
+            "A hardened final index is nonstandard and may not match common wallets.",
             "Index range",
             "Start",
             "End",
@@ -5671,5 +7008,136 @@ AGE-SECRET-KEY-should-be-ignored
     fn fortress_icon_contains_24_mnemonic_blocks() {
         let svg = include_str!("../assets/bip39-tool-icon.svg");
         assert_eq!(svg.matches("rx=\"11.5\"").count(), 24);
+    }
+
+    #[test]
+    fn visually_equivalent_japanese_mnemonic_is_normalized_before_validation() {
+        let mut entropy = [0u8; 16];
+        entropy[1] = 0x60;
+        let normalized = Mnemonic::from_entropy_in(Language::Japanese, &entropy)
+            .unwrap()
+            .to_string();
+        assert!(normalized.contains("あおそ\u{3099}ら"));
+        let nfc = normalized.replace("あおそ\u{3099}ら", "あおぞら");
+
+        let parsed = parse_backup_mnemonic(MnemonicLanguage::Japanese, &nfc).unwrap();
+        assert_eq!(parsed.to_string(), normalized);
+    }
+
+    #[test]
+    fn overflowing_address_range_is_rejected_before_derivation() {
+        let error = derive_address_rows(&[0u8; 64], AddressKind::Bitcoin, 0, u32::MAX, false)
+            .err()
+            .unwrap();
+        assert!(error.contains("at most"));
+    }
+
+    #[test]
+    fn unknown_backup_fields_are_masked_by_default() {
+        let secret = serde_json::Value::String(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                .to_string(),
+        );
+        assert!(is_sensitive_json_key("wallet_phrase"));
+        let display =
+            display_json_value("wallet_phrase", &secret, false, GuidanceLanguage::English);
+        assert!(!display.contains("abandon"));
+    }
+
+    #[test]
+    fn decrypted_backup_envelope_rejects_malformed_seed_and_unknown_language() {
+        let malformed = serde_json::json!({
+            "schema_version": 2,
+            "backup_type": "mnemonic",
+            "language": "English",
+            "seed_phrase": 42,
+        });
+        assert!(validate_backup_envelope(&malformed).is_err());
+        assert!(MnemonicLanguage::try_from_backup_name("Klingon").is_none());
+    }
+
+    #[test]
+    fn clearing_sensitive_state_resets_every_reveal_control() {
+        let mut app = Bip39Gui {
+            reveal_generated: true,
+            reveal_imported_phrase: true,
+            reveal_identity_input: true,
+            reveal_decrypted: true,
+            reveal_recover_shares: true,
+            reveal_recover_passphrase: true,
+            reveal_derive_phrase: true,
+            reveal_derive_passphrase: true,
+            imported_phrase: Zeroizing::new("secret".to_string()),
+            ..Bip39Gui::default()
+        };
+        app.clear_sensitive_state();
+
+        assert!(!app.reveal_generated);
+        assert!(!app.reveal_imported_phrase);
+        assert!(!app.reveal_identity_input);
+        assert!(!app.reveal_decrypted);
+        assert!(!app.reveal_recover_shares);
+        assert!(!app.reveal_recover_passphrase);
+        assert!(!app.reveal_derive_phrase);
+        assert!(!app.reveal_derive_passphrase);
+        assert!(app.imported_phrase.is_empty());
+    }
+
+    #[test]
+    fn separate_sskr_export_creates_one_private_file_per_share() {
+        let entropy = [11u8; 32];
+        let settings = SskrSettings {
+            groups: 1,
+            group_threshold: 1,
+            shares_per_group: 2,
+            required_shares_per_group: 1,
+        };
+        let (sskr, recovery_info) =
+            sskr_backup_from_entropy(&entropy, MnemonicLanguage::English, settings).unwrap();
+        let backup = GuiBackup {
+            created_at_unix: Some(1234),
+            sskr,
+            recovery_info,
+            ..GuiBackup::default()
+        };
+        let parent = tempfile::tempdir().unwrap();
+        let plan = prepare_sskr_export_plan(&backup, parent.path().to_path_buf()).unwrap();
+        let exported = export_sskr_shares_atomic(plan).unwrap();
+
+        let share_files = std::fs::read_dir(&exported)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("group-"))
+            .collect::<Vec<_>>();
+        assert_eq!(share_files.len(), 2);
+        for entry in share_files {
+            let contents = std::fs::read_to_string(entry.path()).unwrap();
+            assert_eq!(contents.lines().count(), 1);
+            assert!(mnemonic_to_share(contents.trim(), Language::English).is_some());
+        }
+    }
+
+    #[test]
+    fn atomic_no_clobber_save_preserves_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("backup.age");
+        std::fs::write(&path, b"original").unwrap();
+        assert!(persist_noclobber(&path, b"replacement").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_save_path_rejects_a_symlinked_grandparent() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let real = tempdir.path().join("real");
+        let link = tempdir.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(real.join("nested")).unwrap();
+        symlink(&real, &link).unwrap();
+        let error = validate_save_path(&link.join("nested/backup.age")).unwrap_err();
+        assert!(error.contains("symlink"));
     }
 }

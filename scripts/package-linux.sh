@@ -34,7 +34,7 @@ if [[ -z "$age_bundle_dir" ]]; then
   age_bundle_dir="$("$script_dir/fetch-age.sh" linux "$age_arch")"
 fi
 
-if [[ ! -x "$age_bundle_dir/age" || ! -f "$age_bundle_dir/LICENSE" ]]; then
+if [[ ! -x "$age_bundle_dir/age" || ! -x "$age_bundle_dir/age-keygen" || ! -f "$age_bundle_dir/LICENSE" ]]; then
   echo "Complete bundled age files not found: $age_bundle_dir" >&2
   exit 1
 fi
@@ -56,6 +56,8 @@ cp "$binary_path" "$app_dir/usr/bin/$executable_name"
 chmod 755 "$app_dir/usr/bin/$executable_name"
 cp "$age_bundle_dir/age" "$app_dir/usr/bin/age"
 chmod 755 "$app_dir/usr/bin/age"
+cp "$age_bundle_dir/age-keygen" "$app_dir/usr/bin/age-keygen"
+chmod 755 "$app_dir/usr/bin/age-keygen"
 cp "$age_bundle_dir/LICENSE" "$app_dir/usr/share/licenses/bip39-tool/age-LICENSE.txt"
 cp "$repo_root/assets/Noto-CJK-LICENSE.txt" "$app_dir/usr/share/licenses/bip39-tool/Noto-CJK-LICENSE.txt"
 cp "$icon_svg" "$app_dir/usr/share/icons/hicolor/scalable/apps/$desktop_id.svg"

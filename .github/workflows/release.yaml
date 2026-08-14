@@ -16,15 +16,33 @@ jobs:
           - os: windows-2025
             target: x86_64-pc-windows-msvc
             artifact_path: target/x86_64-pc-windows-msvc/release/bip39.exe
-            artifact_name: bip39-tool-windows-bin
+            artifact_name: bip39-tool-windows-x86_64-bin
+            package_artifact_name: bip39-tool-windows-x86_64
+            package_archive: bip39-tool-windows-x86_64.zip
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_path: target/x86_64-unknown-linux-gnu/release/bip39
-            artifact_name: bip39-tool-linux-bin
+            artifact_name: bip39-tool-linux-x86_64-bin
+            package_artifact_name: bip39-tool-linux-x86_64
+            package_archive: bip39-tool-linux-x86_64.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_path: target/aarch64-unknown-linux-gnu/release/bip39
+            artifact_name: bip39-tool-linux-aarch64-bin
+            package_artifact_name: bip39-tool-linux-aarch64
+            package_archive: bip39-tool-linux-aarch64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_path: target/aarch64-apple-darwin/release/bip39
-            artifact_name: bip39-tool-macos-bin
+            artifact_name: bip39-tool-macos-aarch64-bin
+            package_artifact_name: bip39-tool-macos-aarch64
+            package_archive: bip39-tool-macos-aarch64.zip
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact_path: target/x86_64-apple-darwin/release/bip39
+            artifact_name: bip39-tool-macos-x86_64-bin
+            package_artifact_name: bip39-tool-macos-x86_64
+            package_archive: bip39-tool-macos-x86_64.zip
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout Repository
@@ -74,17 +92,62 @@ jobs:
       - name: Run Tests
         run: bash scripts/cargo-sanitized.sh test --locked --verbose
 
+      - name: Configure macOS Developer ID Signing
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+        run: |
+          if [[ -z "$APPLE_CERTIFICATE_P12" || -z "$APPLE_DEVELOPER_ID_APPLICATION" ]]; then
+            echo "Apple signing secrets are not configured; producing an ad-hoc signed development artifact."
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/bip39-signing.keychain-db"
+          certificate="$RUNNER_TEMP/bip39-signing.p12"
+          keychain_password="$(openssl rand -hex 24)"
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 -D > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          echo "BIP39_CODESIGN_IDENTITY=$APPLE_DEVELOPER_ID_APPLICATION" >> "$GITHUB_ENV"
+
       - name: Package Linux AppDir
         if: runner.os == 'Linux'
         run: |
           bash scripts/package-linux.sh "${{ matrix.artifact_path }}" "BIP39 Tool.AppDir"
-          tar -czf bip39-tool-linux.tar.gz "BIP39 Tool.AppDir"
+          tar -czf "${{ matrix.package_archive }}" "BIP39 Tool.AppDir"
 
       - name: Package macOS App
         if: runner.os == 'macOS'
+        run: bash scripts/package-macos.sh "${{ matrix.artifact_path }}" "BIP39 Tool.app"
+
+      - name: Notarize macOS App
+        if: runner.os == 'macOS'
+        env:
+          APPLE_NOTARY_ID: ${{ secrets.APPLE_NOTARY_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          bash scripts/package-macos.sh "${{ matrix.artifact_path }}" "BIP39 Tool.app"
-          ditto -c -k --sequesterRsrc --keepParent "BIP39 Tool.app" bip39-tool-macos.zip
+          if [[ -z "$BIP39_CODESIGN_IDENTITY" || -z "$APPLE_NOTARY_ID" || -z "$APPLE_NOTARY_PASSWORD" || -z "$APPLE_TEAM_ID" ]]; then
+            echo "Apple notarization secrets are not configured; skipping notarization."
+            exit 0
+          fi
+          submission="$RUNNER_TEMP/bip39-notary.zip"
+          ditto -c -k --sequesterRsrc --keepParent "BIP39 Tool.app" "$submission"
+          xcrun notarytool submit "$submission" --wait \
+            --apple-id "$APPLE_NOTARY_ID" \
+            --password "$APPLE_NOTARY_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID"
+          xcrun stapler staple "BIP39 Tool.app"
+          xcrun stapler validate "BIP39 Tool.app"
+
+      - name: Archive macOS App
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent "BIP39 Tool.app" "${{ matrix.package_archive }}"
 
       - name: Package Windows App
         if: runner.os == 'Windows'
@@ -94,7 +157,7 @@ jobs:
       - name: Archive Windows App
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -LiteralPath 'BIP39 Tool Windows' -DestinationPath bip39-tool-windows.zip -Force
+        run: Compress-Archive -LiteralPath 'BIP39 Tool Windows' -DestinationPath '${{ matrix.package_archive }}' -Force
 
       - name: Check Binary Path Leaks
         if: runner.os != 'Windows'
@@ -114,8 +177,8 @@ jobs:
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: bip39-tool-linux
-          path: bip39-tool-linux.tar.gz
+          name: ${{ matrix.package_artifact_name }}
+          path: ${{ matrix.package_archive }}
           if-no-files-found: error
           compression-level: 6
           overwrite: true
@@ -124,8 +187,8 @@ jobs:
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: bip39-tool-macos
-          path: bip39-tool-macos.zip
+          name: ${{ matrix.package_artifact_name }}
+          path: ${{ matrix.package_archive }}
           if-no-files-found: error
           compression-level: 6
           overwrite: true
@@ -134,8 +197,8 @@ jobs:
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: bip39-tool-windows
-          path: bip39-tool-windows.zip
+          name: ${{ matrix.package_artifact_name }}
+          path: ${{ matrix.package_archive }}
           if-no-files-found: error
           compression-level: 6
           overwrite: true

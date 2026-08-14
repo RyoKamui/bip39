@@ -38,6 +38,10 @@ if [[ ! -x "$age_bundle_dir/age" ]]; then
   echo "Bundled age executable not found: $age_bundle_dir/age" >&2
   exit 1
 fi
+if [[ ! -x "$age_bundle_dir/age-keygen" ]]; then
+  echo "Bundled age-keygen executable not found: $age_bundle_dir/age-keygen" >&2
+  exit 1
+fi
 if [[ ! -f "$age_bundle_dir/LICENSE" ]]; then
   echo "Bundled age license not found: $age_bundle_dir/LICENSE" >&2
   exit 1
@@ -50,6 +54,8 @@ cp "$binary_path" "$app_path/Contents/MacOS/$executable_name"
 chmod 755 "$app_path/Contents/MacOS/$executable_name"
 cp "$age_bundle_dir/age" "$app_path/Contents/MacOS/age"
 chmod 755 "$app_path/Contents/MacOS/age"
+cp "$age_bundle_dir/age-keygen" "$app_path/Contents/MacOS/age-keygen"
+chmod 755 "$app_path/Contents/MacOS/age-keygen"
 cp "$age_bundle_dir/LICENSE" "$app_path/Contents/Resources/age-LICENSE.txt"
 cp "$icon_path" "$app_path/Contents/Resources/BIP39Tool.icns"
 cp "$repo_root/assets/Noto-CJK-LICENSE.txt" "$app_path/Contents/Resources/Noto-CJK-LICENSE.txt"
@@ -94,10 +100,18 @@ if command -v plutil >/dev/null 2>&1; then
 fi
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --sign - "$app_path/Contents/MacOS/age" >/dev/null
-  codesign --force --deep --sign - "$app_path" >/dev/null
+  signing_identity="${BIP39_CODESIGN_IDENTITY:--}"
+  signing_flags=(--force --sign "$signing_identity")
+  if [[ "$signing_identity" != "-" ]]; then
+    signing_flags+=(--timestamp --options runtime)
+  fi
+  codesign "${signing_flags[@]}" "$app_path/Contents/MacOS/age" >/dev/null
+  codesign "${signing_flags[@]}" "$app_path/Contents/MacOS/age-keygen" >/dev/null
+  codesign "${signing_flags[@]}" "$app_path" >/dev/null
+  codesign --verify --deep --strict "$app_path"
 fi
 
 "$app_path/Contents/MacOS/age" --version >/dev/null
+"$app_path/Contents/MacOS/age-keygen" --version >/dev/null
 
 echo "Created $app_path"

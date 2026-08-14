@@ -24,7 +24,7 @@ fi
 if [[ -z "$age_bundle_dir" ]]; then
   age_bundle_dir="$("$script_dir/fetch-age.sh" windows x86_64)"
 fi
-if [[ ! -x "$age_bundle_dir/age.exe" || ! -f "$age_bundle_dir/LICENSE" ]]; then
+if [[ ! -x "$age_bundle_dir/age.exe" || ! -x "$age_bundle_dir/age-keygen.exe" || ! -f "$age_bundle_dir/LICENSE" ]]; then
   echo "Complete bundled age files not found: $age_bundle_dir" >&2
   exit 1
 fi
@@ -33,9 +33,11 @@ rm -rf "$package_dir"
 mkdir -p "$package_dir"
 cp "$binary_path" "$package_dir/BIP39 Tool.exe"
 cp "$age_bundle_dir/age.exe" "$package_dir/age.exe"
+cp "$age_bundle_dir/age-keygen.exe" "$package_dir/age-keygen.exe"
 cp "$age_bundle_dir/LICENSE" "$package_dir/age-LICENSE.txt"
 cp "$icon_path" "$package_dir/BIP39Tool.ico"
 cp "$repo_root/assets/Noto-CJK-LICENSE.txt" "$package_dir/Noto-CJK-LICENSE.txt"
 
 "$package_dir/age.exe" --version >/dev/null
+"$package_dir/age-keygen.exe" --version >/dev/null
 echo "Created Windows package: $package_dir"
