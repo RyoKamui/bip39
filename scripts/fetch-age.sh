@@ -88,10 +88,36 @@ if [[ ! -x "$bundle_dir/$executable_name" ]] \
   || [[ ! -f "$bundle_dir/LICENSE" ]]; then
   temp_extract="$(mktemp -d "$cache_dir/extract.XXXXXX")"
   trap 'rm -rf "$temp_extract"' EXIT
-  tar -xf "$archive_path" -C "$temp_extract" \
-    "age/$executable_name" \
-    "age/$keygen_name" \
-    age/LICENSE
+  if [[ "$archive_extension" == "zip" ]]; then
+    if command -v unzip >/dev/null 2>&1; then
+      unzip -q "$archive_path" \
+        "age/$executable_name" \
+        "age/$keygen_name" \
+        age/LICENSE \
+        -d "$temp_extract"
+    elif command -v cygpath >/dev/null 2>&1 \
+      && { command -v pwsh >/dev/null 2>&1 || command -v powershell.exe >/dev/null 2>&1; }; then
+      archive_path_windows="$(cygpath -w "$archive_path")"
+      temp_extract_windows="$(cygpath -w "$temp_extract")"
+      if command -v pwsh >/dev/null 2>&1; then
+        powershell=(pwsh)
+      else
+        powershell=(powershell.exe)
+      fi
+      AGE_ARCHIVE_FILE="$archive_path_windows" \
+        AGE_EXTRACT_DIR="$temp_extract_windows" \
+        "${powershell[@]}" -NoLogo -NoProfile -NonInteractive -Command \
+          'Expand-Archive -LiteralPath $env:AGE_ARCHIVE_FILE -DestinationPath $env:AGE_EXTRACT_DIR -Force'
+    else
+      echo "No ZIP extractor is available for the Windows age archive." >&2
+      exit 1
+    fi
+  else
+    tar -xf "$archive_path" -C "$temp_extract" \
+      "age/$executable_name" \
+      "age/$keygen_name" \
+      age/LICENSE
+  fi
   rm -rf "$bundle_dir"
   mv "$temp_extract/age" "$bundle_dir"
   chmod 755 "$bundle_dir/$executable_name"
